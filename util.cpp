@@ -1,6 +1,18 @@
 #include "util.hpp"
 #include <algorithm>
 
+uint32_t calc_crc32(const uint8_t *data, int data_size, uint32_t crc)
+{
+    for (int i = 0; i < data_size; ++i) {
+        uint32_t c = ((crc >> 24) ^ data[i]) << 24;
+        for (int j = 0; j < 8; ++j) {
+            c = (c << 1) ^ (c & 0x80000000 ? 0x04c11db7 : 0);
+        }
+        crc = (crc << 8) ^ c;
+    }
+    return crc;
+}
+
 int extract_psi(PSI *psi, const uint8_t *payload, int payload_size, int unit_start, int counter)
 {
     int copy_pos = 0;
@@ -40,12 +52,14 @@ int extract_psi(PSI *psi, const uint8_t *payload, int payload_size, int unit_sta
         std::copy(payload + copy_pos, payload + copy_pos + copy_size, psi->data + psi->data_count);
         psi->data_count += copy_size;
     }
-    // TODO: CRC32
 
     // If psi->version_number != 0, these fields are valid.
     if (psi->data_count >= 3) {
         int section_length = ((psi->data[1] & 0x03) << 8) | psi->data[2];
-        if (section_length >= 3 && psi->data_count >= 3 + section_length) {
+        if (psi->data_count >= 3 + section_length &&
+            calc_crc32(psi->data, 3 + section_length) == 0 &&
+            section_length >= 3)
+        {
             psi->table_id = psi->data[0];
             psi->section_length = section_length;
             psi->version_number = 0x20 | ((psi->data[5] >> 1) & 0x1f);
