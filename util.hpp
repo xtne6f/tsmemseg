@@ -7,14 +7,13 @@ constexpr uint8_t AVC_VIDEO = 0x1b;
 
 struct PSI
 {
-    int pointer_field;
     int table_id;
     int section_length;
     int version_number;
     int current_next_indicator;
     int continuity_counter;
     int data_count;
-    uint8_t data[1025];
+    uint8_t data[1024];
 };
 
 struct PMT
@@ -36,6 +35,7 @@ struct PAT
     PSI psi;
 };
 
+int extract_psi(PSI *psi, const uint8_t *payload, int payload_size, int unit_start, int counter);
 void extract_pat(PAT *pat, const uint8_t *payload, int payload_size, int unit_start, int counter);
 void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_start, int counter);
 int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size);
