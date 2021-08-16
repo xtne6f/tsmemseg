@@ -2,7 +2,7 @@ tsmemseg - In-memory transport stream segmenter mainly for HLS
 
 Usage:
 
-tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes] seg_name
+tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name
 
 -i inittime (seconds), 0<=range<=60, default=0
   Initial segment duration. Segment is cut on a key (NAL-IDR) packet.
@@ -24,6 +24,11 @@ tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-
 
 -m max_kbytes (kbytes), 32<=range<=32768, default=4096
   Maximum size of each segment. If segment length exceeds this limit, the segment is forcibly cut whether on a key packet or not.
+
+-d flags, range=0 or 1 or 3, default=0
+  Convert ARIB caption/superimpose streams to an ID3 timed-metadata stream that https://github.com/monyone/aribb24.js can recognize.
+  This feature is enabled when "flags" is 1 or 3.
+  If "flags" is 3, this feature treats unknown MPEG2 private data streams as ARIB superimpose.
 
 seg_name
   Used for the name pattern of named-pipes used to access segments.
@@ -66,3 +71,5 @@ Notes:
 This tool currently only supports Windows.
 
 Licensed under MIT.
+
+https://github.com/monyone/node-arib-subtitle-timedmetadater was very helpful in implementing "-d" option.

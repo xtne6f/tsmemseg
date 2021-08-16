@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "id3conv.hpp"
 #include "util.hpp"
 
 namespace
@@ -207,6 +208,7 @@ int main(int argc, char **argv)
     size_t segNum = 8;
     size_t segMaxBytes = 4096 * 1024;
     const char *destName = "";
+    CID3Converter id3conv;
 
     for (int i = 1; i < argc; ++i) {
         char c = '\0';
@@ -214,7 +216,7 @@ int main(int argc, char **argv)
             c = argv[i][1];
         }
         if (c == 'h') {
-            fprintf(stderr, "Usage: tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes] seg_name\n");
+            fprintf(stderr, "Usage: tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name\n");
             return 2;
         }
         bool invalid = false;
@@ -250,6 +252,9 @@ int main(int argc, char **argv)
             else if (c == 'm') {
                 segMaxBytes = static_cast<size_t>(strtol(argv[++i], nullptr, 10) * 1024);
                 invalid = segMaxBytes < 32 * 1024 || 32 * 1024 * 1024 < segMaxBytes;
+            }
+            else if (c == 'd') {
+                id3conv.SetOption(static_cast<int>(strtol(argv[++i], nullptr, 10)));
             }
         }
         else {
@@ -410,6 +415,10 @@ int main(int argc, char **argv)
                 ++syncError;
                 continue;
             }
+            id3conv.AddPacket(packet);
+        }
+        for (auto itPacket = id3conv.GetPackets().cbegin(); itPacket != id3conv.GetPackets().end(); itPacket += 188) {
+            const uint8_t *packet = &*itPacket;
             int unitStart = extract_ts_header_unit_start(packet);
             int pid = extract_ts_header_pid(packet);
             int counter = extract_ts_header_counter(packet);
@@ -542,6 +551,7 @@ int main(int argc, char **argv)
             }
             packets.insert(packets.end(), packet, packet + 188);
         }
+        id3conv.ClearPackets();
 
         if (bufCount >= 188 && bufCount % 188 != 0) {
             std::copy(buf + bufCount / 188 * 188, buf + bufCount, buf);
