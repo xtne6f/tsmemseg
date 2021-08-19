@@ -172,11 +172,12 @@ void WriteUint32(uint8_t *buf, uint32_t n)
     buf[3] = static_cast<uint8_t>(n >> 24);
 }
 
-void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex)
+void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex, bool endList)
 {
     buf.assign(segments.size() * 16, 0);
     WriteUint32(&buf[0], static_cast<uint32_t>(segments.size() - 1));
     WriteUint32(&buf[4], GetCurrentUnixTime());
+    buf[8] = endList;
     for (size_t i = segIndex, j = 1; j < segments.size(); ++j) {
         WriteUint32(&buf[j * 16], static_cast<uint32_t>(i));
         WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
@@ -328,7 +329,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: pipe creation failed.\n");
         return 1;
     }
-    AssignSegmentList(segments.front().buf, segments, 1);
+    AssignSegmentList(segments.front().buf, segments, 1, false);
 
     int64_t baseTick = GetMsecTick();
     std::recursive_mutex bufLock;
@@ -533,7 +534,7 @@ int main(int argc, char **argv)
                     SEGMENT_CONTEXT &segfr = segments.front();
                     std::vector<uint8_t> &segfrBuf =
                         !segfr.backBuf.empty() || segfr.pipes[0].connected || segfr.pipes[1].connected ? segfr.backBuf : segfr.buf;
-                    AssignSegmentList(segfrBuf, segments, segIndex);
+                    AssignSegmentList(segfrBuf, segments, segIndex, false);
 
                     lastPts45khz = pts45khz;
                     targetDurationMsec = nextTargetDurationMsec;
@@ -547,6 +548,16 @@ int main(int argc, char **argv)
             std::copy(buf + bufCount / 188 * 188, buf + bufCount, buf);
         }
         bufCount %= 188;
+    }
+
+    {
+        lock_recursive_mutex lock(bufLock);
+
+        // End list
+        SEGMENT_CONTEXT &segfr = segments.front();
+        std::vector<uint8_t> &segfrBuf =
+            !segfr.backBuf.empty() || segfr.pipes[0].connected || segfr.pipes[1].connected ? segfr.backBuf : segfr.buf;
+        AssignSegmentList(segfrBuf, segments, segIndex, true);
     }
 
     if (syncError) {

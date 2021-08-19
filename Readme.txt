@@ -44,6 +44,7 @@ Specification of "listing pipe":
 "listing pipe" contains the following binary data in 16 bytes units. All values are written in little endian.
 The 0th byte of the first 16 bytes unit stores the number of following 16 bytes units. This is the same value as seg_num.
 The sequence of 4-7th bytes stores the UNIX time when this list was updated.
+8th stores whether this list will be updated later (0) or it has been no longer updated (1).
 
 Subsequent 16 bytes units contain information about each segment. Newly updated segment is stored backward.
 The 0th byte of the units stores the index of the segment pointed to. The range is between 1 and seg_num.
