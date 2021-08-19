@@ -320,7 +320,7 @@ void CID3Converter::CheckPrivateDataPes(const std::vector<uint8_t> &pes)
         m_packets.push_back(static_cast<uint8_t>((i == 0 ? 0x40 : 0) | ((m_id3Pid >> 8) & 0x1f)));
         m_packets.push_back(static_cast<uint8_t>(m_id3Pid));
         m_id3Counter = (m_id3Counter + 1) & 0x0f;
-        size_t len = std::min(i + 184, m_buf.size());
+        size_t len = std::min<size_t>(184, m_buf.size() - i);
         m_packets.push_back((len < 184 ? 0x30 : 0x10) | m_id3Counter);
         if (len < 184) {
             m_packets.push_back(static_cast<uint8_t>(183 - len));
