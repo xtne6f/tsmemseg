@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -55,6 +56,16 @@ uint32_t GetCurrentUnixTime()
     GetSystemTimeAsFileTime(&ft);
     int64_t ll = ft.dwLowDateTime | (static_cast<int64_t>(ft.dwHighDateTime) << 32);
     return static_cast<uint32_t>((ll - 116444736000000000) / 10000000);
+}
+
+void ClosingRunner(const char *closingCmd, HANDLE stopEvent, std::atomic_uint32_t &lastAccessTick, uint32_t accessTimeoutMsec)
+{
+    while (accessTimeoutMsec == 0 || static_cast<uint32_t>(GetMsecTick()) - lastAccessTick < accessTimeoutMsec) {
+        if (WaitForSingleObject(stopEvent, 1000) != WAIT_TIMEOUT) {
+            break;
+        }
+    }
+    system(closingCmd);
 }
 
 void Worker(SEGMENT_CONTEXT *segments, std::vector<HANDLE> events, std::recursive_mutex &bufLock, std::atomic_uint32_t &lastAccessTick)
@@ -155,16 +166,6 @@ void ClearSegmentsAndEvents(std::vector<SEGMENT_CONTEXT> &segments, std::vector<
     }
 }
 
-bool CheckAccessTimeout(int64_t tick, const std::atomic_uint32_t *lastAccessTicks, size_t n, uint32_t accessTimeoutMsec)
-{
-    for (size_t i = 0; i < n; ++i) {
-        if (static_cast<uint32_t>(tick) - lastAccessTicks[i] < accessTimeoutMsec) {
-            return false;
-        }
-    }
-    return true;
-}
-
 void WriteUint32(uint8_t *buf, uint32_t n)
 {
     buf[0] = static_cast<uint8_t>(n);
@@ -173,11 +174,12 @@ void WriteUint32(uint8_t *buf, uint32_t n)
     buf[3] = static_cast<uint8_t>(n >> 24);
 }
 
-void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex)
+void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex, bool endList)
 {
     buf.assign(segments.size() * 16, 0);
     WriteUint32(&buf[0], static_cast<uint32_t>(segments.size() - 1));
     WriteUint32(&buf[4], GetCurrentUnixTime());
+    buf[8] = endList;
     for (size_t i = segIndex, j = 1; j < segments.size(); ++j) {
         WriteUint32(&buf[j * 16], static_cast<uint32_t>(i));
         WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
@@ -203,6 +205,7 @@ int main(int argc, char **argv)
     uint32_t targetDurationMsec = 0;
     uint32_t nextTargetDurationMsec = 2000;
     uint32_t accessTimeoutMsec = 10000;
+    const char *closingCmd = "";
     int readRatePerMille = -1;
     int nextReadRatePerMille = 0;
     size_t segNum = 8;
@@ -216,7 +219,7 @@ int main(int argc, char **argv)
             c = argv[i][1];
         }
         if (c == 'h') {
-            fprintf(stderr, "Usage: tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name\n");
+            fprintf(stderr, "Usage: tsmemseg [-i inittime][-t time][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name\n");
             return 2;
         }
         bool invalid = false;
@@ -235,6 +238,9 @@ int main(int argc, char **argv)
                 if (!invalid) {
                     accessTimeoutMsec = static_cast<uint32_t>(sec * 1000);
                 }
+            }
+            else if (c == 'c') {
+                closingCmd = argv[++i];
             }
             else if (c == 'r' || c == 'f') {
                 double percent = strtod(argv[++i], nullptr);
@@ -333,20 +339,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: pipe creation failed.\n");
         return 1;
     }
-    AssignSegmentList(segments.front().buf, segments, 1);
+    AssignSegmentList(segments.front().buf, segments, 1, false);
 
     int64_t baseTick = GetMsecTick();
     std::recursive_mutex bufLock;
+    std::unique_ptr<std::thread> closingRunnerThread;
     std::vector<std::thread> threads;
-    std::atomic_uint32_t lastAccessTicks[SEGMENTS_MAX / 20];
+    std::atomic_uint32_t lastAccessTick(static_cast<uint32_t>(baseTick));
+
+    if (closingCmd[0]) {
+        closingRunnerThread.reset(new std::thread(ClosingRunner, closingCmd, events.front(), std::ref(lastAccessTick), accessTimeoutMsec));
+    }
 
     // Create a thread for every 20 segments
     for (size_t i = 0; i < segments.size(); i += 20) {
         std::vector<HANDLE> eventsForThread;
         eventsForThread.push_back(events.front());
         eventsForThread.insert(eventsForThread.end(), events.begin() + 1 + i * 2, events.begin() + std::min(1 + (i + 20) * 2, events.size()));
-        lastAccessTicks[i / 20] = static_cast<uint32_t>(baseTick);
-        threads.emplace_back(Worker, segments.data() + i, std::move(eventsForThread), std::ref(bufLock), std::ref(lastAccessTicks[i / 20]));
+        threads.emplace_back(Worker, segments.data() + i, std::move(eventsForThread), std::ref(bufLock), std::ref(lastAccessTick));
     }
 
     // Index of the next segment to be overwritten (between 1 and "segNum")
@@ -381,7 +391,7 @@ int main(int argc, char **argv)
         bool accessTimedout = false;
         for (;;) {
             int64_t nowTick = GetMsecTick();
-            if (accessTimeoutMsec != 0 && CheckAccessTimeout(nowTick, lastAccessTicks, threads.size(), accessTimeoutMsec)) {
+            if (accessTimeoutMsec != 0 && static_cast<uint32_t>(nowTick) - lastAccessTick >= accessTimeoutMsec) {
                 accessTimedout = true;
                 break;
             }
@@ -542,7 +552,7 @@ int main(int argc, char **argv)
                     SEGMENT_CONTEXT &segfr = segments.front();
                     std::vector<uint8_t> &segfrBuf =
                         !segfr.backBuf.empty() || segfr.pipes[0].connected || segfr.pipes[1].connected ? segfr.backBuf : segfr.buf;
-                    AssignSegmentList(segfrBuf, segments, segIndex);
+                    AssignSegmentList(segfrBuf, segments, segIndex, false);
 
                     lastPts45khz = pts45khz;
                     targetDurationMsec = nextTargetDurationMsec;
@@ -559,19 +569,32 @@ int main(int argc, char **argv)
         bufCount %= 188;
     }
 
+    {
+        lock_recursive_mutex lock(bufLock);
+
+        // End list
+        SEGMENT_CONTEXT &segfr = segments.front();
+        std::vector<uint8_t> &segfrBuf =
+            !segfr.backBuf.empty() || segfr.pipes[0].connected || segfr.pipes[1].connected ? segfr.backBuf : segfr.buf;
+        AssignSegmentList(segfrBuf, segments, segIndex, true);
+    }
+
     if (syncError) {
         fprintf(stderr, "Warning: %u sync error happened.\n", syncError);
     }
     if (forcedSegmentationError) {
         fprintf(stderr, "Warning: %u forced segmentation happened.\n", forcedSegmentationError);
     }
-    while (accessTimeoutMsec != 0 && !CheckAccessTimeout(GetMsecTick(), lastAccessTicks, threads.size(), accessTimeoutMsec)) {
+    while (accessTimeoutMsec != 0 && static_cast<uint32_t>(GetMsecTick()) - lastAccessTick < accessTimeoutMsec) {
         Sleep(100);
     }
     SetEvent(events.front());
     while (!threads.empty()) {
         threads.back().join();
         threads.pop_back();
+    }
+    if (closingRunnerThread) {
+        closingRunnerThread->join();
     }
     ClearSegmentsAndEvents(segments, events);
     return 0;

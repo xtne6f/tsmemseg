@@ -2,7 +2,7 @@ tsmemseg - In-memory transport stream segmenter mainly for HLS
 
 Usage:
 
-tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name
+tsmemseg [-i inittime][-t time][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name
 
 -i inittime (seconds), 0<=range<=60, default=0
   Initial segment duration. Segment is cut on a key (NAL-IDR) packet.
@@ -12,6 +12,9 @@ tsmemseg [-i inittime][-t time][-a acc_timeout][-r readrate][-f fill_readrate][-
 
 -a acc_timeout (seconds), 0<=range<=600, default=10
   Quit when the named-pipes of this tool have not been accessed for more than acc_timeout. 0 means no quit.
+
+-c cmd
+  Run command once when this tool is closing or access-timedout. "cmd" string is passed to system() C function.
 
 -r readrate (percent), 0 or 20<=range<=500, default=0
   Read speed from standard input compared to media timestamp (PTS). 0 means unlimited.
@@ -49,6 +52,7 @@ Specification of "listing pipe":
 "listing pipe" contains the following binary data in 16 bytes units. All values are written in little endian.
 The 0th byte of the first 16 bytes unit stores the number of following 16 bytes units. This is the same value as seg_num.
 The sequence of 4-7th bytes stores the UNIX time when this list was updated.
+8th stores whether this list will be updated later (0) or it has been no longer updated (1).
 
 Subsequent 16 bytes units contain information about each segment. Newly updated segment is stored backward.
 The 0th byte of the units stores the index of the segment pointed to. The range is between 1 and seg_num.
