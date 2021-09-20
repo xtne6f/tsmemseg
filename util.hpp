@@ -1,7 +1,7 @@
 #ifndef INCLUDE_UTIL_HPP
 #define INCLUDE_UTIL_HPP
 
-#include <cstdint>
+#include <stdint.h>
 
 constexpr uint8_t AVC_VIDEO = 0x1b;
 

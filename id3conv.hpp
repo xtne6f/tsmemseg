@@ -2,7 +2,7 @@
 #define INCLUDE_ID3CONV_HPP
 
 #include "util.hpp"
-#include <cstdint>
+#include <stdint.h>
 #include <unordered_set>
 #include <utility>
 #include <vector>
