@@ -11,7 +11,7 @@ tsmemseg [-i inittime][-t time][-a acc_timeout][-c cmd][-r readrate][-f fill_rea
   Duration other than the initial segment.
 
 -a acc_timeout (seconds), 0<=range<=600, default=10
-  Quit when the named-pipes of this tool have not been accessed for more than acc_timeout. 0 means no quit.
+  Quit when the named-pipes/FIFOs of this tool have not been accessed for more than acc_timeout. 0 means no quit.
 
 -c cmd
   Run command once when this tool is closing or access-timedout. "cmd" string is passed to system() C function.
@@ -29,17 +29,18 @@ tsmemseg [-i inittime][-t time][-a acc_timeout][-c cmd][-r readrate][-f fill_rea
   Maximum size of each segment. If segment length exceeds this limit, the segment is forcibly cut whether on a key packet or not.
 
 seg_name
-  Used for the name pattern of named-pipes used to access segments.
+  Used for the name pattern of named-pipes/FIFOs used to access segments.
   Available characters are 0-9, A-Z, a-z, '_'. Maximum length is 65.
-  For instance, if "foo123_" is specified, the name pattern of named-pipes is "\\.\pipe\tsmemseg_foo123_??".
+  For instance, if "foo123_" is specified, the name pattern of named-pipes/FIFOs is "\\.\pipe\tsmemseg_foo123_??" or "/tmp/tsmemseg_foo123_??.fifo".
 
 Description:
 
 Standard input to this tool is assumed to be an MPEG transport stream which contains a single PMT stream, and a single MPEG-4 AVC video stream
 with appropriate keyframe interval. This is such as a stream that is encoded using FFmpeg.
-This tool does not output any files. Users can access each segment via Windows named-pipe (typically, using fopen("rb")).
-Information corresponding to HLS playlist file (.m3u8) can be obtained via "\\.\pipe\tsmemseg_{seg_name}00". (hereinafter "listing pipe")
-Actual segment data (MPEG-TS) can be obtained via between "\\.\pipe\tsmemseg_{seg_name}01" and "\\.\pipe\tsmemseg_{seg_name}{seg_num}". (hereinafter "segment pipe")
+This tool does not output any files. Users can access each segment via Windows named-pipe or Unix FIFO (typically, using fopen("rb")).
+Information corresponding to HLS playlist file (.m3u8) can be obtained via "\\.\pipe\tsmemseg_{seg_name}00" or "/tmp/tsmemseg_{seg_name}00.fifo". (hereinafter "listing pipe")
+Actual segment data (MPEG-TS) can be obtained via between "tsmemseg_{seg_name}01" and "tsmemseg_{seg_name}{seg_num}". (hereinafter "segment pipe")
+For FIFOs, exclusive lock (flock(LOCK_EX)) should be obtained if simultaneous access is possible.
 For example, this tool is intended to be used in server-side scripts on web servers.
 
 Specification of "listing pipe":
@@ -67,6 +68,6 @@ All other unused bytes are initialized with 0.
 
 Notes:
 
-This tool currently only supports Windows.
+This tool currently only supports Windows and Linux.
 
 Licensed under MIT.

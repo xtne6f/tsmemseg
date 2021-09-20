@@ -1,13 +1,24 @@
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <fcntl.h>
 #include <io.h>
+#include <stdexcept>
+#else
+#include <errno.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <condition_variable>
+#endif
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -23,16 +34,63 @@ constexpr size_t SEGMENTS_MAX = 100;
 
 using lock_recursive_mutex = std::lock_guard<std::recursive_mutex>;
 
+class CManualResetEvent
+{
+public:
+#ifdef _WIN32
+    CManualResetEvent(bool initialState = false) {
+        m_h = CreateEvent(nullptr, FALSE, initialState, nullptr);
+        if (!m_h) throw std::runtime_error("");
+    }
+    ~CManualResetEvent() { CloseHandle(m_h); }
+    void Set() { SetEvent(m_h); }
+    HANDLE Handle() { return m_h; }
+    bool WaitOne(std::chrono::milliseconds rel) {
+        return WaitForSingleObject(m_h, static_cast<DWORD>(rel.count())) == WAIT_OBJECT_0;
+    }
+#else
+    CManualResetEvent() : m_state(false) {}
+    void Set() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_state = true;
+        }
+        m_cond.notify_all();
+    }
+    bool WaitOne(std::chrono::milliseconds rel) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cond.wait_for(lock, rel, [this]() { return m_state; });
+    }
+#endif
+    CManualResetEvent(const CManualResetEvent &) = delete;
+    CManualResetEvent &operator=(const CManualResetEvent &) = delete;
+
+private:
+#ifdef _WIN32
+    HANDLE m_h;
+#else
+    bool m_state;
+    std::mutex m_mutex;
+    std::condition_variable m_cond;
+#endif
+};
+
 struct SEGMENT_PIPE_CONTEXT
 {
+#ifdef _WIN32
     HANDLE h;
     OVERLAPPED ol;
     bool initialized;
+#else
+    int fd;
+    size_t written;
+#endif
     bool connected;
 };
 
 struct SEGMENT_CONTEXT
 {
+    char path[128];
     SEGMENT_PIPE_CONTEXT pipes[2];
     std::vector<uint8_t> buf;
     std::vector<uint8_t> backBuf;
@@ -40,33 +98,37 @@ struct SEGMENT_CONTEXT
     uint32_t segDurationMsec;
 };
 
+void SleepFor(std::chrono::milliseconds rel)
+{
+#ifdef _WIN32
+    // MSVC sleep_for() is buggy
+    Sleep(static_cast<DWORD>(rel.count()));
+#else
+    std::this_thread::sleep_for(rel);
+#endif
+}
+
 int64_t GetMsecTick()
 {
-    LARGE_INTEGER f, c;
-    if (QueryPerformanceFrequency(&f) && QueryPerformanceCounter(&c)) {
-        return c.QuadPart / f.QuadPart * 1000 + c.QuadPart % f.QuadPart * 1000 / f.QuadPart;
-    }
-    return 0;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 uint32_t GetCurrentUnixTime()
 {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    int64_t ll = ft.dwLowDateTime | (static_cast<int64_t>(ft.dwHighDateTime) << 32);
-    return static_cast<uint32_t>((ll - 116444736000000000) / 10000000);
+    return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-void ClosingRunner(const char *closingCmd, HANDLE stopEvent, std::atomic_uint32_t &lastAccessTick, uint32_t accessTimeoutMsec)
+void ClosingRunner(const char *closingCmd, CManualResetEvent &stopEvent, std::atomic_uint32_t &lastAccessTick, uint32_t accessTimeoutMsec)
 {
     while (accessTimeoutMsec == 0 || static_cast<uint32_t>(GetMsecTick()) - lastAccessTick < accessTimeoutMsec) {
-        if (WaitForSingleObject(stopEvent, 1000) != WAIT_TIMEOUT) {
+        if (stopEvent.WaitOne(std::chrono::milliseconds(1000))) {
             break;
         }
     }
     system(closingCmd);
 }
 
+#ifdef _WIN32
 void Worker(SEGMENT_CONTEXT *segments, std::vector<HANDLE> events, std::recursive_mutex &bufLock, std::atomic_uint32_t &lastAccessTick)
 {
     for (;;) {
@@ -146,24 +208,110 @@ void Worker(SEGMENT_CONTEXT *segments, std::vector<HANDLE> events, std::recursiv
         }
     }
 }
-
-void ClearSegmentsAndEvents(std::vector<SEGMENT_CONTEXT> &segments, std::vector<HANDLE> &events)
+#else
+void Worker(std::vector<SEGMENT_CONTEXT> &segments, CManualResetEvent &stopEvent, std::recursive_mutex &bufLock, std::atomic_uint32_t &lastAccessTick)
 {
-    while (!segments.empty()) {
-        for (size_t i = 0; i < 2; ++i) {
-            if (segments.back().pipes[i].h != INVALID_HANDLE_VALUE) {
-                CloseHandle(segments.back().pipes[i].h);
+    for (;;) {
+        int64_t tick = GetMsecTick();
+        bool connected = false;
+        for (auto it = segments.begin(); it != segments.end(); ++it) {
+            SEGMENT_PIPE_CONTEXT &pipe = it->pipes[0];
+            if (!pipe.connected) {
+                {
+                    lock_recursive_mutex lock(bufLock);
+
+                    // it->backBuf is used only when it->buf is in use, so this will be the rare case.
+                    if (!it->backBuf.empty()) {
+                        // Swap and clear the back buffer.
+                        it->buf.swap(it->backBuf);
+                        std::vector<uint8_t>().swap(it->backBuf);
+                    }
+                }
+                // Start connecting
+                pipe.fd = open(it->path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+                if (pipe.fd >= 0) {
+                    lastAccessTick = static_cast<uint32_t>(tick);
+                    pipe.written = 0;
+
+                    lock_recursive_mutex lock(bufLock);
+                    pipe.connected = true;
+                }
+            }
+            connected = connected || pipe.connected;
+        }
+
+        // Sleep for 50 msec
+        tick += 50;
+
+        while (connected) {
+            connected = false;
+            for (auto it = segments.begin(); it != segments.end(); ++it) {
+                SEGMENT_PIPE_CONTEXT &pipe = it->pipes[0];
+                if (pipe.connected) {
+                    ssize_t n = 0;
+                    while (pipe.written < it->buf.size() &&
+                           (n = write(pipe.fd, it->buf.data() + pipe.written, it->buf.size() - pipe.written)) > 0) {
+                        pipe.written += n;
+                    }
+                    if (pipe.written < it->buf.size() && n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        connected = true;
+                    }
+                    else {
+                        close(pipe.fd);
+
+                        lock_recursive_mutex lock(bufLock);
+                        pipe.connected = false;
+                    }
+                }
+            }
+            // Sleep a little
+            if (GetMsecTick() >= tick || stopEvent.WaitOne(std::chrono::milliseconds(1))) {
+                break;
             }
         }
-        segments.pop_back();
-    }
-    while (!events.empty()) {
-        if (events.back()) {
-            CloseHandle(events.back());
+        if (stopEvent.WaitOne(std::chrono::milliseconds(std::max<int64_t>(tick - GetMsecTick(), 1)))) {
+            break;
         }
-        events.pop_back();
+    }
+
+    // Close all files
+    for (auto it = segments.begin(); it != segments.end(); ++it) {
+        if (it->pipes[0].connected) {
+            close(it->pipes[0].fd);
+        }
     }
 }
+#endif
+
+void CloseSegments(const std::vector<SEGMENT_CONTEXT> &segments)
+{
+    for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
+#ifdef _WIN32
+        for (size_t i = 0; i < 2; ++i) {
+            if (it->pipes[i].h != INVALID_HANDLE_VALUE) {
+                CloseHandle(it->pipes[i].h);
+            }
+        }
+#else
+        unlink(it->path);
+#endif
+    }
+}
+
+#ifndef _WIN32
+const std::vector<SEGMENT_CONTEXT> *g_signalParam;
+
+void SignalHandler(int signum)
+{
+    // Unlink all fifo files.
+    CloseSegments(*g_signalParam);
+
+    struct sigaction sigact = {};
+    sigact.sa_handler = SIG_DFL;
+    sigaction(signum, &sigact, nullptr);
+    raise(signum);
+}
+#endif
 
 void WriteUint32(uint8_t *buf, uint32_t n)
 {
@@ -287,72 +435,96 @@ int main(int argc, char **argv)
     FILE *fp = fopen("test.m2t", "rb");
 #else
     FILE *fp = stdin;
+#ifdef _WIN32
     if (_setmode(_fileno(fp), _O_BINARY) < 0) {
         fprintf(stderr, "Error: _setmode.\n");
         return 1;
     }
 #endif
+#endif
 
     // segments.front() is segment list, the others are segments.
     std::vector<SEGMENT_CONTEXT> segments;
-    // events.front() is stop-event, the others are used for asynchronous writing of segments.
-    std::vector<HANDLE> events(1, CreateEvent(nullptr, TRUE, FALSE, nullptr));
+    CManualResetEvent stopEvent;
+#ifdef _WIN32
+    // Used for asynchronous writing of segments.
+    std::vector<std::unique_ptr<CManualResetEvent>> events;
+#endif
 
-    if (events.front()) {
-        while (segments.size() < 1 + segNum) {
-            SEGMENT_CONTEXT seg = {};
-            char pipeName[128];
-            sprintf(pipeName, "\\\\.\\pipe\\tsmemseg_%s%02d", destName, static_cast<int>(segments.size()));
-            // Create 2 pipes for simultaneous access
-            size_t createdCount = 0;
-            for (; createdCount < 2; ++createdCount) {
-                events.push_back(CreateEvent(nullptr, TRUE, TRUE, nullptr));
-                if (!events.back()) {
-                    break;
-                }
-                seg.pipes[createdCount].h = CreateNamedPipeA(pipeName, PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED, 0, 2, 48128, 0, 0, nullptr);
-                if (seg.pipes[createdCount].h == INVALID_HANDLE_VALUE) {
-                    break;
-                }
-            }
-            if (createdCount < 2) {
-                if (createdCount == 1) {
-                    CloseHandle(seg.pipes[0].h);
-                }
+    while (segments.size() < 1 + segNum) {
+        SEGMENT_CONTEXT seg = {};
+#ifdef _WIN32
+        sprintf(seg.path, "\\\\.\\pipe\\tsmemseg_%s%02d", destName, static_cast<int>(segments.size()));
+        // Create 2 pipes for simultaneous access
+        size_t createdCount = 0;
+        for (; createdCount < 2; ++createdCount) {
+            events.emplace_back(new CManualResetEvent(true));
+            seg.pipes[createdCount].h = CreateNamedPipeA(seg.path, PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED, 0, 2, 48128, 0, 0, nullptr);
+            if (seg.pipes[createdCount].h == INVALID_HANDLE_VALUE) {
                 break;
             }
-            seg.segCount = SEGMENT_COUNT_EMPTY;
-            if (!segments.empty()) {
-                seg.buf.assign(188, 0);
-                WriteSegmentHeader(seg.buf, seg.segCount);
-            }
-            segments.push_back(std::move(seg));
         }
+        if (createdCount < 2) {
+            if (createdCount == 1) {
+                CloseHandle(seg.pipes[0].h);
+            }
+            break;
+        }
+#else
+        sprintf(seg.path, "/tmp/tsmemseg_%s%02d.fifo", destName, static_cast<int>(segments.size()));
+        if (mkfifo(seg.path, S_IRWXU) != 0) {
+            break;
+        }
+#endif
+        seg.segCount = SEGMENT_COUNT_EMPTY;
+        if (!segments.empty()) {
+            seg.buf.assign(188, 0);
+            WriteSegmentHeader(seg.buf, seg.segCount);
+        }
+        segments.push_back(std::move(seg));
     }
     if (segments.size() < 1 + segNum) {
-        ClearSegmentsAndEvents(segments, events);
-        fprintf(stderr, "Error: pipe creation failed.\n");
+        CloseSegments(segments);
+        fprintf(stderr, "Error: pipe/fifo creation failed.\n");
         return 1;
     }
     AssignSegmentList(segments.front().buf, segments, 1, false);
 
+#ifndef _WIN32
+    struct sigaction sigact = {};
+    sigact.sa_handler = SignalHandler;
+    g_signalParam = &segments;
+    sigaction(SIGHUP, &sigact, nullptr);
+    sigaction(SIGINT, &sigact, nullptr);
+    sigaction(SIGTERM, &sigact, nullptr);
+    sigact.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sigact, nullptr);
+#endif
+
     int64_t baseTick = GetMsecTick();
     std::recursive_mutex bufLock;
-    std::unique_ptr<std::thread> closingRunnerThread;
+    std::thread closingRunnerThread;
     std::vector<std::thread> threads;
     std::atomic_uint32_t lastAccessTick(static_cast<uint32_t>(baseTick));
 
     if (closingCmd[0]) {
-        closingRunnerThread.reset(new std::thread(ClosingRunner, closingCmd, events.front(), std::ref(lastAccessTick), accessTimeoutMsec));
+        closingRunnerThread = std::thread(ClosingRunner, closingCmd, std::ref(stopEvent), std::ref(lastAccessTick), accessTimeoutMsec);
     }
 
+#ifdef _WIN32
     // Create a thread for every 20 segments
     for (size_t i = 0; i < segments.size(); i += 20) {
         std::vector<HANDLE> eventsForThread;
-        eventsForThread.push_back(events.front());
-        eventsForThread.insert(eventsForThread.end(), events.begin() + 1 + i * 2, events.begin() + std::min(1 + (i + 20) * 2, events.size()));
+        eventsForThread.push_back(stopEvent.Handle());
+        for (size_t j = i * 2; j < (i + 20) * 2 && j < events.size(); ++j) {
+            eventsForThread.push_back(events[j]->Handle());
+        }
         threads.emplace_back(Worker, segments.data() + i, std::move(eventsForThread), std::ref(bufLock), std::ref(lastAccessTick));
     }
+#else
+    // Use one thread
+    threads.emplace_back(Worker, std::ref(segments), std::ref(stopEvent), std::ref(bufLock), std::ref(lastAccessTick));
+#endif
 
     // Index of the next segment to be overwritten (between 1 and "segNum")
     size_t segIndex = 1;
@@ -404,7 +576,7 @@ int main(int argc, char **argv)
                 uint32_t ptsDiff = pts45khz - lastPts45khz;
                 if (!(ptsDiff >> 31) && entireDurationMsec + ptsDiff / 45 > (nowTick - baseTick) * readRatePerMille / 1000) {
                     // Too fast
-                    Sleep(10);
+                    SleepFor(std::chrono::milliseconds(10));
                     continue;
                 }
             }
@@ -576,16 +748,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "Warning: %u forced segmentation happened.\n", forcedSegmentationError);
     }
     while (accessTimeoutMsec != 0 && static_cast<uint32_t>(GetMsecTick()) - lastAccessTick < accessTimeoutMsec) {
-        Sleep(100);
+        SleepFor(std::chrono::milliseconds(100));
     }
-    SetEvent(events.front());
+    stopEvent.Set();
     while (!threads.empty()) {
         threads.back().join();
         threads.pop_back();
     }
-    if (closingRunnerThread) {
-        closingRunnerThread->join();
+    if (closingRunnerThread.joinable()) {
+        closingRunnerThread.join();
     }
-    ClearSegmentsAndEvents(segments, events);
+    CloseSegments(segments);
     return 0;
 }
