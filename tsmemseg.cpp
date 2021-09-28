@@ -39,7 +39,7 @@ class CManualResetEvent
 public:
 #ifdef _WIN32
     CManualResetEvent(bool initialState = false) {
-        m_h = CreateEvent(nullptr, FALSE, initialState, nullptr);
+        m_h = CreateEvent(nullptr, TRUE, initialState, nullptr);
         if (!m_h) throw std::runtime_error("");
     }
     ~CManualResetEvent() { CloseHandle(m_h); }
