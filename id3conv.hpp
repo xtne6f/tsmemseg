@@ -30,7 +30,7 @@ private:
     std::pair<int, std::vector<uint8_t>> m_captionPes;
     std::pair<int, std::vector<uint8_t>> m_superimposePes;
     int m_pcrPid;
-    uint8_t m_pcr[5];
+    int64_t m_pcr;
     int m_id3Pid;
     uint8_t m_id3Counter;
     uint8_t m_pmtCounter;

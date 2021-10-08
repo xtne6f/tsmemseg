@@ -7,13 +7,13 @@ CID3Converter::CID3Converter()
     , m_captionPid(0)
     , m_superimposePid(0)
     , m_pcrPid(0)
+    , m_pcr(-1)
     , m_id3Pid(0)
     , m_id3Counter(0)
     , m_pmtCounter(0)
 {
     static const PAT zeroPat = {};
     m_pat = zeroPat;
-    std::fill_n(m_pcr, 5, static_cast<uint8_t>(0));
 }
 
 void CID3Converter::SetOption(int flags)
@@ -54,11 +54,11 @@ void CID3Converter::AddPacket(const uint8_t *packet)
         if (adaptation & 2) {
             int adaptationLength = packet[4];
             if (adaptationLength >= 6 && !!(packet[5] & 0x10)) {
-                m_pcr[0] = 0x20 | ((packet[6] >> 4) & 0x0e) | 1; // 3 bits
-                m_pcr[1] = ((packet[6] << 3) & 0xf8) | (packet[7] >> 5); // 5 + 3 bits
-                m_pcr[2] = ((packet[7] << 3) & 0xf8) | ((packet[8] >> 5) & 0x06) | 1; // 5 + 2 bits
-                m_pcr[3] = ((packet[8] << 2) & 0xfc) | (packet[9] >> 6); // 6 + 2 bits
-                m_pcr[4] = ((packet[9] << 2) & 0xfc) | ((packet[10] >> 6) & 0x20) | 1; // 6 + 1 bits
+                m_pcr = (packet[10] >> 7) |
+                        (packet[9] << 1) |
+                        (packet[8] << 9) |
+                        (packet[7] << 17) |
+                        (static_cast<int64_t>(packet[6]) << 25);
             }
         }
         m_packets.insert(m_packets.end(), packet, packet + 188);
@@ -109,7 +109,7 @@ void CID3Converter::AddPmt(int pid, const PSI &psi)
     int serviceID = (table[3] << 8) | table[4];
     m_pcrPid = ((table[8] & 0x03) << 8) | table[9];
     if (m_pcrPid == 0x1fff) {
-        std::fill_n(m_pcr, 5, static_cast<uint8_t>(0));
+        m_pcr = -1;
     }
     int programInfoLength = ((table[10] & 0x03) << 8) | table[11];
     int pos = 3 + 9 + programInfoLength;
@@ -231,24 +231,28 @@ void CID3Converter::CheckPrivateDataPes(const std::vector<uint8_t> &pes)
     const uint8_t PRIVATE_STREAM_2 = 0xbf;
 
     size_t payloadPos = 0;
-    const uint8_t *pts = nullptr;
+    uint8_t pts[5] = {};
     if (pes[0] == 0 && pes[1] == 0 && pes[2] == 1) {
         int streamID = pes[3];
         if (streamID == PRIVATE_STREAM_1 && pes.size() >= 9) {
             int ptsDtsFlags = pes[7] >> 6;
             payloadPos = 9 + pes[8];
             if (ptsDtsFlags >= 2 && pes.size() >= 14) {
-                pts = pes.data() + 9;
+                std::copy(pes.begin() + 9, pes.begin() + 14, pts);
             }
         }
         else if (streamID == PRIVATE_STREAM_2) {
             payloadPos = 6;
-            if (m_pcr[0] != 0) {
-                pts = m_pcr;
+            if (m_pcr >= 0) {
+                pts[0] = static_cast<uint8_t>(m_pcr >> 29) | 0x21; // 3 bits
+                pts[1] = static_cast<uint8_t>(m_pcr >> 22); // 8 bits
+                pts[2] = static_cast<uint8_t>(m_pcr >> 14) | 1; // 7 bits
+                pts[3] = static_cast<uint8_t>(m_pcr >> 7); // 8 bits
+                pts[4] = static_cast<uint8_t>(m_pcr << 1) | 1; // 7 bits
             }
         }
     }
-    if (payloadPos == 0 || payloadPos + 1 >= pes.size() || !pts) {
+    if (payloadPos == 0 || payloadPos + 1 >= pes.size() || pts[0] == 0) {
         return;
     }
     int dataIdentifier = pes[payloadPos];
