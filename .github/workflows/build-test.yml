@@ -1,0 +1,25 @@
+on: push
+permissions:
+  contents: read
+jobs:
+  build-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Build
+        run: make
+      - name: Test
+        run: |
+          printf "" | ./tsmemseg -a 20 test_ &
+          pid=$!
+          sleep 2
+          test -e /tmp/tsmemseg_test_00.fifo
+          ret=$?
+          kill $pid
+          sleep 2
+          test $ret -eq 0 -a ! -e /tmp/tsmemseg_test_00.fifo
