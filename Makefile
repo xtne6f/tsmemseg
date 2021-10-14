@@ -4,7 +4,7 @@ ifdef MINGW_PREFIX
   LDFLAGS := -static $(LDFLAGS)
   TARGET ?= tsmemseg.exe
 else
-  LDFLAGS := -lpthread $(LDFLAGS)
+  LDFLAGS := -pthread $(LDFLAGS)
   TARGET ?= tsmemseg
 endif
 
