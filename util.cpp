@@ -127,7 +127,7 @@ void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_st
             int pos = 3 + 9 + program_info_length;
             while (pos + 4 < 3 + pmt->psi.section_length - 4/*CRC32*/) {
                 int stream_type = table[pos];
-                if (stream_type == AVC_VIDEO) {
+                if (stream_type == AVC_VIDEO || stream_type == H_265_VIDEO) {
                     pmt->first_video_stream_type = stream_type;
                     pmt->first_video_pid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
                     break;
@@ -140,7 +140,7 @@ void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_st
     while (!done);
 }
 
-int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size)
+int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size, bool h_265)
 {
     for (int i = 0; i < payload_size; ++i) {
         // 0,1,2: Searching for NAL start code
@@ -154,8 +154,8 @@ int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size)
             }
         }
         else if (*nal_state == 3) {
-            int nal_unit_type = payload[i] & 0x1f;
-            if (nal_unit_type == 5) {
+            int nal_unit_type = h_265 ? (payload[i] >> 1) & 0x3f : payload[i] & 0x1f;
+            if ((h_265 && (nal_unit_type == 19 || nal_unit_type == 20)) || (!h_265 && nal_unit_type == 5)) {
                 // 4: Stop searching
                 ++*nal_state;
                 return 1;

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 constexpr uint8_t AVC_VIDEO = 0x1b;
+constexpr uint8_t H_265_VIDEO = 0x24;
 
 struct PSI
 {
@@ -39,7 +40,7 @@ uint32_t calc_crc32(const uint8_t *data, int data_size, uint32_t crc = 0xfffffff
 int extract_psi(PSI *psi, const uint8_t *payload, int payload_size, int unit_start, int counter);
 void extract_pat(PAT *pat, const uint8_t *payload, int payload_size, int unit_start, int counter);
 void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_start, int counter);
-int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size);
+int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size, bool h_265);
 int get_ts_payload_size(const uint8_t *packet);
 
 inline int extract_ts_header_sync(const uint8_t *packet) { return packet[0]; }

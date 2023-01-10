@@ -560,7 +560,7 @@ int main(int argc, char **argv)
     size_t segIndex = 1;
     // Sequence count of segments
     uint32_t segCount = 0;
-    // PID of the packet to determine segmentation (Currently this is AVC_VIDEO)
+    // PID of the packet to determine segmentation (Currently this is AVC_VIDEO or H_265_VIDEO)
     int keyPid = 0;
     // AVC-NAL's parsing state
     int nalState = 0;
@@ -639,7 +639,9 @@ int main(int argc, char **argv)
                 extract_pmt(&pat.first_pmt, payload, payloadSize, unitStart, counter);
             }
             else if (pid == pat.first_pmt.first_video_pid &&
-                     pat.first_pmt.first_video_stream_type == AVC_VIDEO) {
+                     (pat.first_pmt.first_video_stream_type == AVC_VIDEO ||
+                      pat.first_pmt.first_video_stream_type == H_265_VIDEO)) {
+                bool h265 = pat.first_pmt.first_video_stream_type == H_265_VIDEO;
                 if (unitStart) {
                     for (auto it = unitStartMap.begin(); it != unitStartMap.end(); ++it) {
                         it->second.second = it->second.first;
@@ -661,7 +663,7 @@ int main(int argc, char **argv)
                             }
                         }
                         if (9 + pesHeaderLength < payloadSize) {
-                            if (contains_nal_idr(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength))) {
+                            if (contains_nal_idr(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
                                 isKey = !isFirstKey;
                                 isFirstKey = false;
                             }
@@ -669,7 +671,7 @@ int main(int argc, char **argv)
                     }
                 }
                 else if (pid == keyPid) {
-                    if (contains_nal_idr(&nalState, payload, payloadSize)) {
+                    if (contains_nal_idr(&nalState, payload, payloadSize, h265)) {
                         isKey = !isFirstKey;
                         isFirstKey = false;
                     }

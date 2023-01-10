@@ -35,7 +35,7 @@ seg_name
 
 Description:
 
-Standard input to this tool is assumed to be an MPEG transport stream which contains a single PMT stream, and a single MPEG-4 AVC video stream
+Standard input to this tool is assumed to be an MPEG transport stream which contains a single PMT stream, and a single MPEG-4 AVC / HEVC video stream
 with appropriate keyframe interval. This is such as a stream that is encoded using FFmpeg.
 This tool does not output any files. Users can access each segment via Windows named-pipe or Unix FIFO (typically, using fopen("rb")).
 Information corresponding to HLS playlist file (.m3u8) can be obtained via "\\.\pipe\tsmemseg_{seg_name}00" or "/tmp/tsmemseg_{seg_name}00.fifo". (hereinafter "listing pipe")
