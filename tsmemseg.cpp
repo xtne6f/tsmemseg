@@ -26,12 +26,15 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "mp4fragmenter.hpp"
 #include "util.hpp"
 
 namespace
 {
 constexpr uint32_t SEGMENT_COUNT_EMPTY = 0x1000000;
 constexpr size_t SEGMENTS_MAX = 100;
+constexpr int MP4_FRAG_MIN_COUNT = 10;
+constexpr size_t MP4_FRAG_MAX_NUM = 20;
 
 using lock_recursive_mutex = std::lock_guard<std::recursive_mutex>;
 
@@ -96,7 +99,8 @@ struct SEGMENT_CONTEXT
     std::vector<uint8_t> buf;
     std::vector<uint8_t> backBuf;
     uint32_t segCount;
-    uint32_t segDurationMsec;
+    int segDurationMsec;
+    std::vector<int> fragDurationsMsec;
 };
 
 void SleepFor(std::chrono::milliseconds rel)
@@ -351,21 +355,31 @@ void WriteUint32(uint8_t *buf, uint32_t n)
     buf[3] = static_cast<uint8_t>(n >> 24);
 }
 
-void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex, bool endList)
+void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex,
+                       bool endList, bool incomplete, bool isMp4, const std::vector<uint8_t> &mp4Header)
 {
     buf.assign(segments.size() * 16, 0);
     WriteUint32(&buf[0], static_cast<uint32_t>(segments.size() - 1));
     WriteUint32(&buf[4], GetCurrentUnixTime());
     buf[8] = endList;
+    buf[9] = incomplete;
+    buf[10] = isMp4;
     for (size_t i = segIndex, j = 1; j < segments.size(); ++j) {
         WriteUint32(&buf[j * 16], static_cast<uint32_t>(i));
         WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
         WriteUint32(&buf[j * 16 + 8], segments[i].segDurationMsec);
+        WriteUint32(&buf[j * 16 + 12], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
+        for (size_t k = 0; k < segments[i].fragDurationsMsec.size(); ++k) {
+            buf.insert(buf.end(), 16, 0);
+            WriteUint32(&buf[buf.size() - 16], segments[i].fragDurationsMsec[k]);
+        }
         i = i % (segments.size() - 1) + 1;
     }
+    buf.insert(buf.end(), mp4Header.begin(), mp4Header.end());
+    WriteUint32(&buf[12], static_cast<uint32_t>(buf.size() - segments.size() * 16));
 }
 
-void WriteSegmentHeader(std::vector<uint8_t> &buf, uint32_t segCount)
+void WriteSegmentHeader(std::vector<uint8_t> &buf, uint32_t segCount, bool isMp4, const std::vector<size_t> &fragSizes)
 {
     // NULL TS header
     buf[0] = 0x47;
@@ -373,14 +387,31 @@ void WriteSegmentHeader(std::vector<uint8_t> &buf, uint32_t segCount)
     buf[2] = 0xff;
     buf[3] = 0x10;
     WriteUint32(&buf[4], segCount);
-    WriteUint32(&buf[8], static_cast<uint32_t>(buf.size() / 188 - 1));
+    WriteUint32(&buf[8], static_cast<uint32_t>((buf.size() - 188) / (isMp4 ? 1 : 188)));
+    buf[12] = isMp4;
+    if (isMp4) {
+        size_t remainSize = buf.size() - 188;
+        size_t i = 0;
+        for (; i + 1 < std::min(fragSizes.size(), MP4_FRAG_MAX_NUM) && remainSize >= fragSizes[i]; ++i) {
+            WriteUint32(&buf[i * 4 + 32], static_cast<uint32_t>(fragSizes[i]));
+            remainSize -= fragSizes[i];
+        }
+        WriteUint32(&buf[i * 4 + 32], static_cast<uint32_t>(remainSize));
+    }
+}
+
+std::vector<uint8_t> &SelectWritableSegmentBuffer(SEGMENT_CONTEXT &seg)
+{
+    return !seg.backBuf.empty() || seg.pipes[0].connected || seg.pipes[1].connected ? seg.backBuf : seg.buf;
 }
 }
 
 int main(int argc, char **argv)
 {
+    bool isMp4 = false;
     uint32_t targetDurationMsec = 0;
     uint32_t nextTargetDurationMsec = 2000;
+    uint32_t targetFragDurationMsec = 500;
     uint32_t accessTimeoutMsec = 10000;
     const char *closingCmd = "";
     int readRatePerMille = -1;
@@ -388,6 +419,7 @@ int main(int argc, char **argv)
     size_t segNum = 8;
     size_t segMaxBytes = 4096 * 1024;
     const char *destName = "";
+    CMp4Fragmenter mp4frag;
 
     for (int i = 1; i < argc; ++i) {
         char c = '\0';
@@ -395,16 +427,19 @@ int main(int argc, char **argv)
             c = argv[i][1];
         }
         if (c == 'h') {
-            fprintf(stderr, "Usage: tsmemseg [-i inittime][-t time][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes] seg_name\n");
+            fprintf(stderr, "Usage: tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes] seg_name\n");
             return 2;
         }
         bool invalid = false;
         if (i < argc - 1) {
-            if (c == 'i' || c == 't') {
+            if (c == '4') {
+                isMp4 = true;
+            }
+            else if (c == 'i' || c == 't' || c == 'p') {
                 double sec = strtod(argv[++i], nullptr);
                 invalid = !(0 <= sec && sec <= 60);
                 if (!invalid) {
-                    uint32_t &msec = c == 'i' ? targetDurationMsec : nextTargetDurationMsec;
+                    uint32_t &msec = c == 'i' ? targetDurationMsec : c == 't' ? nextTargetDurationMsec : targetFragDurationMsec;
                     msec = static_cast<uint32_t>(sec * 1000);
                 }
             }
@@ -509,7 +544,7 @@ int main(int argc, char **argv)
         seg.segCount = SEGMENT_COUNT_EMPTY;
         if (!segments.empty()) {
             seg.buf.assign(188, 0);
-            WriteSegmentHeader(seg.buf, seg.segCount);
+            WriteSegmentHeader(seg.buf, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
         }
         segments.push_back(std::move(seg));
     }
@@ -518,7 +553,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: pipe/fifo creation failed.\n");
         return 1;
     }
-    AssignSegmentList(segments.front().buf, segments, 1, false);
+    AssignSegmentList(segments.front().buf, segments, 1, false, false, isMp4, mp4frag.GetHeader());
 
 #ifndef _WIN32
     struct sigaction sigact = {};
@@ -560,28 +595,50 @@ int main(int argc, char **argv)
     size_t segIndex = 1;
     // Sequence count of segments
     uint32_t segCount = 0;
+    // The last segment is incomplete
+    bool segIncomplete = false;
     // PID of the packet to determine segmentation (Currently this is AVC_VIDEO or H_265_VIDEO)
     int keyPid = 0;
     // AVC-NAL's parsing state
     int nalState = 0;
-    // Map of PID and unit-start position. The second of the pair is the last unit-start immediately before "keyPid" unit-start.
-    std::unordered_map<int, std::pair<size_t, size_t>> unitStartMap;
+    // Counter for MP4 fragmentation timing
+    int countMp4Fragmentation = 0;
+    // Counter point to create MP4 fragment
+    int markedCountMp4Fragmentation = -1;
+
+    struct UNIT_START_POSITION
+    {
+        size_t lastPos;
+        // The last unit-start immediately before "keyPid" unit-start
+        size_t beforeKeyStart;
+        // The last unit-start immediately before "keyPid" unit-start marked for MP4 fragmentation
+        size_t beforeMarkedKeyStart;
+    };
+    // Map of PID and unit-start position
+    std::unordered_map<int, UNIT_START_POSITION> unitStartMap;
     // Packets accumulating for next segmentation
     std::vector<uint8_t> packets;
     std::vector<uint8_t> backPackets;
+    std::vector<uint8_t> workPackets;
 
     unsigned int syncError = 0;
     unsigned int forcedSegmentationError = 0;
     int64_t entireDurationMsec = 0;
-    uint32_t durationMsecResidual45khz = 0;
-    uint32_t pts45khz = 0;
-    uint32_t lastPts45khz = 0;
-    bool ptsInitialized = false;
+    int64_t durationMsecResidual = 0;
+    int64_t pts = -1;
+    int64_t lastPts = -1;
+    int64_t lastFragPts = -1;
+    int64_t markedFragPts = -1;
+    bool firstAudioPacketArrived = false;
     bool isFirstKey = true;
     PAT pat = {};
     uint8_t buf[188 * 16];
     size_t bufCount = 0;
     size_t nRead;
+
+    //FILE *fpDebug = fopen("C:\\foo\\bar.mp4", "wb");
+    //bool debugHeader = false;
+
     while ((nRead = fread(buf + bufCount, 1, sizeof(buf) - bufCount, fp)) != 0) {
         bufCount += nRead;
 
@@ -603,8 +660,8 @@ int main(int argc, char **argv)
             }
             if (readRatePerMille > 0) {
                 // Check reading speed
-                uint32_t ptsDiff = pts45khz - lastPts45khz;
-                if (!(ptsDiff >> 31) && entireDurationMsec + ptsDiff / 45 > (nowTick - baseTick) * readRatePerMille / 1000) {
+                int64_t ptsDiff = (0x200000000 + pts - lastPts) & 0x1ffffffff;
+                if (ptsDiff < 0x100000000 && entireDurationMsec + ptsDiff / 90 > (nowTick - baseTick) * readRatePerMille / 1000) {
                     // Too fast
                     SleepFor(std::chrono::milliseconds(10));
                     continue;
@@ -626,7 +683,8 @@ int main(int argc, char **argv)
             int pid = extract_ts_header_pid(packet);
             int counter = extract_ts_header_counter(packet);
             if (unitStart) {
-                unitStartMap.emplace(pid, std::pair<size_t, size_t>(0, SIZE_MAX)).first->second.first = packets.size();
+                UNIT_START_POSITION unitStartPos = {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+                unitStartMap.emplace(pid, unitStartPos).first->second.lastPos = packets.size();
             }
             int payloadSize = get_ts_payload_size(packet);
             const uint8_t *payload = packet + 188 - payloadSize;
@@ -638,13 +696,33 @@ int main(int argc, char **argv)
             else if (pid == pat.first_pmt.pmt_pid) {
                 extract_pmt(&pat.first_pmt, payload, payloadSize, unitStart, counter);
             }
+            else if (pid == pat.first_pmt.first_adts_audio_pid) {
+                firstAudioPacketArrived = true;
+            }
             else if (pid == pat.first_pmt.first_video_pid &&
                      (pat.first_pmt.first_video_stream_type == AVC_VIDEO ||
                       pat.first_pmt.first_video_stream_type == H_265_VIDEO)) {
                 bool h265 = pat.first_pmt.first_video_stream_type == H_265_VIDEO;
                 if (unitStart) {
+                    // Avoid skipping beginning of video due to lack of information for MP4 header generation.
+                    if (pat.first_pmt.first_adts_audio_pid == 0 || firstAudioPacketArrived) {
+                        ++countMp4Fragmentation;
+                    }
+                    bool markForFrag = false;
+                    if (markedCountMp4Fragmentation < 0 &&
+                        countMp4Fragmentation >= MP4_FRAG_MIN_COUNT &&
+                        ((0x200000000 + pts - lastFragPts) & 0x1ffffffff) / 90 >= targetFragDurationMsec)
+                    {
+                        markForFrag = true;
+                        markedCountMp4Fragmentation = countMp4Fragmentation;
+                        markedFragPts = pts;
+                    }
+
                     for (auto it = unitStartMap.begin(); it != unitStartMap.end(); ++it) {
-                        it->second.second = it->second.first;
+                        it->second.beforeKeyStart = it->second.lastPos;
+                        if (markForFrag) {
+                            it->second.beforeMarkedKeyStart = it->second.beforeKeyStart;
+                        }
                     }
                     keyPid = pid;
                     nalState = 0;
@@ -652,14 +730,10 @@ int main(int argc, char **argv)
                         int ptsDtsFlags = payload[7] >> 6;
                         int pesHeaderLength = payload[8];
                         if (ptsDtsFlags >= 2 && payloadSize >= 14) {
-                            pts45khz = (static_cast<uint32_t>((payload[9] >> 1) & 7) << 29) |
-                                       (payload[10] << 21) |
-                                       (((payload[11] >> 1) & 0x7f) << 14) |
-                                       (payload[12] << 6) |
-                                       ((payload[13] >> 2) & 0x3f);
-                            if (!ptsInitialized) {
-                                lastPts45khz = pts45khz;
-                                ptsInitialized = true;
+                            pts = get_pes_timestamp(payload + 9);
+                            if (lastPts < 0) {
+                                lastPts = pts;
+                                lastFragPts = pts;
                             }
                         }
                         if (9 + pesHeaderLength < payloadSize) {
@@ -678,38 +752,30 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (isKey || packets.size() + 188 > segMaxBytes) {
-                uint32_t ptsDiff = pts45khz - lastPts45khz;
-                if (ptsDiff >> 31) {
+            bool forceSegment = packets.size() + 188 > segMaxBytes;
+            if (isKey || forceSegment ||
+                (isMp4 && markedCountMp4Fragmentation >= 0 &&
+                 countMp4Fragmentation >= markedCountMp4Fragmentation + MP4_FRAG_MIN_COUNT / 2))
+            {
+                int64_t ptsDiff = (0x200000000 + pts - lastPts) & 0x1ffffffff;
+                if (ptsDiff >= 0x100000000) {
                     // PTS went back, rare case.
                     ptsDiff = 0;
                 }
-                if (!isKey || ptsDiff >= targetDurationMsec * 45) {
-                    lock_recursive_mutex lock(bufLock);
-
-                    SEGMENT_CONTEXT &seg = segments[segIndex];
-                    segIndex = segIndex % segNum + 1;
-                    seg.segCount = (++segCount) & 0xffffff;
-                    seg.segDurationMsec = ptsDiff / 45;
-                    durationMsecResidual45khz += ptsDiff % 45;
-                    seg.segDurationMsec += durationMsecResidual45khz / 45;
-                    durationMsecResidual45khz %= 45;
-                    entireDurationMsec += seg.segDurationMsec;
-
-                    std::vector<uint8_t> &segBuf =
-                        !seg.backBuf.empty() || seg.pipes[0].connected || seg.pipes[1].connected ? seg.backBuf : seg.buf;
-                    segBuf.assign(188, 0);
-
+                if (!isKey || ptsDiff >= targetDurationMsec * 90) {
+                    workPackets.clear();
                     backPackets.clear();
-                    if (isKey) {
-                        size_t keyUnitStartPos = unitStartMap[keyPid].second;
+
+                    if (isKey || !forceSegment) {
+                        size_t keyUnitStartPos = isKey ? unitStartMap[keyPid].beforeKeyStart :
+                                                         unitStartMap[keyPid].beforeMarkedKeyStart;
                         // Bring PAT and PMT to the front
                         int bringState = 0;
                         for (size_t i = 0; i < packets.size() && i < keyUnitStartPos && bringState < 2; i += 188) {
                             int p = extract_ts_header_pid(&packets[i]);
                             if (p == 0 || p == pat.first_pmt.pmt_pid) {
                                 bringState = p == 0 ? 1 : bringState == 1 ? 2 : bringState;
-                                segBuf.insert(segBuf.end(), packets.begin() + i, packets.begin() + i + 188);
+                                workPackets.insert(workPackets.end(), packets.begin() + i, packets.begin() + i + 188);
                             }
                         }
                         bringState = 0;
@@ -722,8 +788,9 @@ int main(int argc, char **argv)
                                 }
                                 else {
                                     auto it = unitStartMap.find(p);
-                                    if (it == unitStartMap.end() || i < std::min(it->second.first, it->second.second)) {
-                                        segBuf.insert(segBuf.end(), packets.begin() + i, packets.begin() + i + 188);
+                                    if (it == unitStartMap.end() ||
+                                        i < std::min(it->second.lastPos, isKey ? it->second.beforeKeyStart : it->second.beforeMarkedKeyStart)) {
+                                        workPackets.insert(workPackets.end(), packets.begin() + i, packets.begin() + i + 188);
                                     }
                                     else {
                                         backPackets.insert(backPackets.end(), packets.begin() + i, packets.begin() + i + 188);
@@ -737,20 +804,77 @@ int main(int argc, char **argv)
                     }
                     else {
                         // Packets have been accumulated over the limit, simply segment everything.
-                        segBuf.insert(segBuf.end(), packets.begin(), packets.end());
+                        workPackets.assign(packets.begin(), packets.end());
                         ++forcedSegmentationError;
                     }
                     packets.swap(backPackets);
 
-                    WriteSegmentHeader(segBuf, seg.segCount);
+                    if (isMp4) {
+                        mp4frag.AddPackets(workPackets, pat.first_pmt);
+                    }
+                    if (!isKey && !forceSegment) {
+                        countMp4Fragmentation -= markedCountMp4Fragmentation;
+                        lastFragPts = markedFragPts;
+                    }
+                    else {
+                        countMp4Fragmentation = 0;
+                        lastFragPts = pts;
+                    }
+                    markedCountMp4Fragmentation = -1;
 
-                    SEGMENT_CONTEXT &segfr = segments.front();
-                    std::vector<uint8_t> &segfrBuf =
-                        !segfr.backBuf.empty() || segfr.pipes[0].connected || segfr.pipes[1].connected ? segfr.backBuf : segfr.buf;
-                    AssignSegmentList(segfrBuf, segments, segIndex, false);
+                    lock_recursive_mutex lock(bufLock);
 
-                    lastPts45khz = pts45khz;
-                    targetDurationMsec = nextTargetDurationMsec;
+                    SEGMENT_CONTEXT &seg = segments[segIncomplete ? (segIndex + segNum - 2) % segNum + 1 : segIndex];
+                    if (!segIncomplete) {
+                        segIndex = segIndex % segNum + 1;
+                        seg.segCount = (++segCount) & 0xffffff;
+                    }
+                    segIncomplete = !isKey && !forceSegment;
+                    seg.segDurationMsec = static_cast<int>((ptsDiff + durationMsecResidual) / 90);
+                    if (!segIncomplete) {
+                        durationMsecResidual = (ptsDiff + durationMsecResidual) % 90;
+                        entireDurationMsec += seg.segDurationMsec;
+                        lastPts = pts;
+                        targetDurationMsec = nextTargetDurationMsec;
+                    }
+
+                    std::vector<uint8_t> &segBuf = SelectWritableSegmentBuffer(seg);
+                    segBuf.assign(188, 0);
+
+                    if (isMp4) {
+                        seg.fragDurationsMsec = mp4frag.GetFragmentDurationsMsec();
+                        // Limit the total number of fragments
+                        size_t undeterminedSize = 0;
+                        for (size_t i = seg.fragDurationsMsec.size(); i >= MP4_FRAG_MAX_NUM; --i) {
+                            if (segIncomplete) {
+                                undeterminedSize += mp4frag.GetFragmentSizes()[i - 1];
+                            }
+                            if (i > MP4_FRAG_MAX_NUM) {
+                                seg.fragDurationsMsec[i - 2] += seg.fragDurationsMsec.back();
+                                seg.fragDurationsMsec.pop_back();
+                            }
+                            else if (segIncomplete) {
+                                // In incomplete state, duration of the limited fragment is undetermined, remote it too
+                                seg.fragDurationsMsec.pop_back();
+                            }
+                        }
+                        segBuf.insert(segBuf.end(), mp4frag.GetFragments().begin(), mp4frag.GetFragments().end() - undeterminedSize);
+                    }
+                    else {
+                        segBuf.insert(segBuf.end(), workPackets.begin(), workPackets.end());
+                    }
+
+                    WriteSegmentHeader(segBuf, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
+                    if (!segIncomplete) {
+                        //if (!debugHeader) {
+                        //    debugHeader = true;
+                        //    fwrite(mp4frag.GetHeader().data(), 1, mp4frag.GetHeader().size(), fpDebug);
+                        //}
+                        //fwrite(mp4frag.GetFragments().data(), 1, mp4frag.GetFragments().size(), fpDebug);
+                        mp4frag.ClearFragments();
+                    }
+                    std::vector<uint8_t> &segfrBuf = SelectWritableSegmentBuffer(segments.front());
+                    AssignSegmentList(segfrBuf, segments, segIndex, false, segIncomplete, isMp4, mp4frag.GetHeader());
                 }
                 unitStartMap.clear();
             }
@@ -767,10 +891,8 @@ int main(int argc, char **argv)
         lock_recursive_mutex lock(bufLock);
 
         // End list
-        SEGMENT_CONTEXT &segfr = segments.front();
-        std::vector<uint8_t> &segfrBuf =
-            !segfr.backBuf.empty() || segfr.pipes[0].connected || segfr.pipes[1].connected ? segfr.backBuf : segfr.buf;
-        AssignSegmentList(segfrBuf, segments, segIndex, true);
+        std::vector<uint8_t> &segfrBuf = SelectWritableSegmentBuffer(segments.front());
+        AssignSegmentList(segfrBuf, segments, segIndex, true, false, isMp4, mp4frag.GetHeader());
     }
 
     if (syncError) {
