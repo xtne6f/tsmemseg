@@ -9,7 +9,7 @@ else
 endif
 
 all: $(TARGET)
-$(TARGET): tsmemseg.cpp util.cpp util.hpp id3conv.cpp id3conv.hpp
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH) -o $@ tsmemseg.cpp util.cpp id3conv.cpp
+$(TARGET): tsmemseg.cpp util.cpp util.hpp id3conv.cpp id3conv.hpp mp4fragmenter.cpp mp4fragmenter.hpp
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH) -o $@ tsmemseg.cpp util.cpp id3conv.cpp mp4fragmenter.cpp
 clean:
 	$(RM) $(TARGET)

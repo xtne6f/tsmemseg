@@ -124,13 +124,22 @@ void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_st
             int program_info_length = ((table[10] & 0x03) << 8) | table[11];
 
             pmt->first_video_pid = 0;
+            pmt->first_adts_audio_pid = 0;
+            pmt->first_id3_metadata_pid = 0;
+
             int pos = 3 + 9 + program_info_length;
             while (pos + 4 < 3 + pmt->psi.section_length - 4/*CRC32*/) {
                 int stream_type = table[pos];
-                if (stream_type == AVC_VIDEO) {
+                int pid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
+                if ((stream_type == AVC_VIDEO || stream_type == H_265_VIDEO) && pmt->first_video_pid == 0) {
                     pmt->first_video_stream_type = stream_type;
-                    pmt->first_video_pid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
-                    break;
+                    pmt->first_video_pid = pid;
+                }
+                else if (stream_type == ADTS_TRANSPORT && pmt->first_adts_audio_pid == 0) {
+                    pmt->first_adts_audio_pid = pid;
+                }
+                else if (stream_type == PES_ID3_METADATA && pmt->first_id3_metadata_pid == 0) {
+                    pmt->first_id3_metadata_pid = pid;
                 }
                 int es_info_length = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
                 pos += 5 + es_info_length;
@@ -140,7 +149,7 @@ void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_st
     while (!done);
 }
 
-int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size)
+int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size, bool h_265)
 {
     for (int i = 0; i < payload_size; ++i) {
         // 0,1,2: Searching for NAL start code
@@ -154,8 +163,8 @@ int contains_nal_idr(int *nal_state, const uint8_t *payload, int payload_size)
             }
         }
         else if (*nal_state == 3) {
-            int nal_unit_type = payload[i] & 0x1f;
-            if (nal_unit_type == 5) {
+            int nal_unit_type = h_265 ? (payload[i] >> 1) & 0x3f : payload[i] & 0x1f;
+            if ((h_265 && (nal_unit_type == 19 || nal_unit_type == 20)) || (!h_265 && nal_unit_type == 5)) {
                 // 4: Stop searching
                 ++*nal_state;
                 return 1;
@@ -187,4 +196,13 @@ int get_ts_payload_size(const uint8_t *packet)
         }
     }
     return 0;
+}
+
+int64_t get_pes_timestamp(const uint8_t *data_5bytes)
+{
+    return (data_5bytes[4] >> 1) |
+           (data_5bytes[3] << 7) |
+           ((data_5bytes[2] & 0xfe) << 14) |
+           (data_5bytes[1] << 22) |
+           (static_cast<int64_t>(data_5bytes[0] & 0x0e) << 29);
 }

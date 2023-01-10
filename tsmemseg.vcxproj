@@ -153,11 +153,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="id3conv.cpp" />
+    <ClCompile Include="mp4fragmenter.cpp" />
     <ClCompile Include="tsmemseg.cpp" />
     <ClCompile Include="util.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="id3conv.hpp" />
+    <ClInclude Include="mp4fragmenter.hpp" />
     <ClInclude Include="util.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

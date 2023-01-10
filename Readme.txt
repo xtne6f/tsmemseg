@@ -2,13 +2,19 @@ tsmemseg - In-memory transport stream segmenter mainly for HLS
 
 Usage:
 
-tsmemseg [-i inittime][-t time][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name
+tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name
+
+-4
+  Convert to fragmented MP4.
 
 -i inittime (seconds), 0<=range<=60, default=0
   Initial segment duration. Segment is cut on a key (NAL-IDR) packet.
 
 -t time (seconds), 0<=range<=60, default=2
   Duration other than the initial segment.
+
+-p ptime (seconds), 0<=range<=60, default=0.5
+  Target duration for partial segments (MP4 fragments).
 
 -a acc_timeout (seconds), 0<=range<=600, default=10
   Quit when the named-pipes/FIFOs of this tool have not been accessed for more than acc_timeout. 0 means no quit.
@@ -40,11 +46,11 @@ seg_name
 
 Description:
 
-Standard input to this tool is assumed to be an MPEG transport stream which contains a single PMT stream, and a single MPEG-4 AVC video stream
+Standard input to this tool is assumed to be an MPEG transport stream which contains a single PMT stream, and a single MPEG-4 AVC / HEVC video stream
 with appropriate keyframe interval. This is such as a stream that is encoded using FFmpeg.
 This tool does not output any files. Users can access each segment via Windows named-pipe or Unix FIFO (typically, using fopen("rb")).
 Information corresponding to HLS playlist file (.m3u8) can be obtained via "\\.\pipe\tsmemseg_{seg_name}00" or "/tmp/tsmemseg_{seg_name}00.fifo". (hereinafter "listing pipe")
-Actual segment data (MPEG-TS) can be obtained via between "tsmemseg_{seg_name}01" and "tsmemseg_{seg_name}{seg_num}". (hereinafter "segment pipe")
+Actual segment data (MPEG-TS or fragmented MP4) can be obtained via between "tsmemseg_{seg_name}01" and "tsmemseg_{seg_name}{seg_num}". (hereinafter "segment pipe")
 For FIFOs, exclusive lock (flock(LOCK_EX)) should be obtained if simultaneous access is possible.
 For example, this tool is intended to be used in server-side scripts on web servers.
 
@@ -54,21 +60,31 @@ Specification of "listing pipe":
 The 0th byte of the first 16 bytes unit stores the number of following 16 bytes units. This is the same value as seg_num.
 The sequence of 4-7th bytes stores the UNIX time when this list was updated.
 8th stores whether this list will be updated later (0) or it has been no longer updated (1).
+9th stores whether the available last segment is "incomplete" (1, means additional MP4 fragments will be added later) or not (0).
+10th stores whether each segment is MPEG-TS (0) or MP4 (1).
+12-15th stores byte length of extra readable area after the subsequent units.
 
 Subsequent 16 bytes units contain information about each segment. Newly updated segment is stored backward.
 The 0th byte of the units stores the index of the segment pointed to. The range is between 1 and seg_num.
 4-6th stores the sequential number of segment.
 7th stores whether segment is available (0) or unavailable (1).
 8-11th stores the duration of segment in milliseconds.
+12-15th stores the number of MP4 fragments in this segment. Information about each fragment can be get by following each 16 bytes unit.
+
+Information about MP4 fragments (16 bytes units) are placed in the extra readable area.
+The 0-3th byte of the units stores the duration of fragment in milliseconds.
+Besides the fragment information, if there is space in the extra readable area, it is MP4 header box (ftyp/moov).
+
 All other unused bytes are initialized with 0.
 
 Specification of "segment pipe":
 
-"segment pipe" contains MPEG-TS packets in 188 bytes units.
+"segment pipe" contains MPEG-TS packets or MP4 moof boxes.
 The first unit is always TS-NULL packet and its payload contains the following information.
 The sequence of 4-6th bytes (immediately after TS-NULL header) stores the sequential number of this segment.
 7th stores whether this segment is available (0) or unavailable (1).
-8-11th stores the number of following 188 bytes units. These units are the MPEG-TS stream itself.
+8-11th stores the number of following 188 bytes units (MPEG-TS) or bytes (MP4). These are the MPEG-TS/MP4 stream itself.
+12th stores whether this segment is MPEG-TS (0) or MP4 (1).
 All other unused bytes are initialized with 0.
 
 Notes:
@@ -78,3 +94,5 @@ This tool currently only supports Windows and Linux.
 Licensed under MIT.
 
 https://github.com/monyone/node-arib-subtitle-timedmetadater was very helpful in implementing "-d" option.
+
+https://github.com/monyone/biim was very very helpful in implementing "-4" option.
