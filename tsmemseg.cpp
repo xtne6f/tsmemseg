@@ -737,7 +737,7 @@ int main(int argc, char **argv)
                             }
                         }
                         if (9 + pesHeaderLength < payloadSize) {
-                            if (contains_nal_idr(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
+                            if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
                                 isKey = !isFirstKey;
                                 isFirstKey = false;
                             }
@@ -745,7 +745,7 @@ int main(int argc, char **argv)
                     }
                 }
                 else if (pid == keyPid) {
-                    if (contains_nal_idr(&nalState, payload, payloadSize, h265)) {
+                    if (contains_nal_irap(&nalState, payload, payloadSize, h265)) {
                         isKey = !isFirstKey;
                         isFirstKey = false;
                     }
@@ -810,7 +810,7 @@ int main(int argc, char **argv)
                     packets.swap(backPackets);
 
                     if (isMp4) {
-                        mp4frag.AddPackets(workPackets, pat.first_pmt);
+                        mp4frag.AddPackets(workPackets, pat.first_pmt, !isKey && forceSegment);
                     }
                     if (!isKey && !forceSegment) {
                         countMp4Fragmentation -= markedCountMp4Fragmentation;

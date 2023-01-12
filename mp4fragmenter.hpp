@@ -10,7 +10,7 @@ class CMp4Fragmenter
 {
 public:
     CMp4Fragmenter();
-    void AddPackets(std::vector<uint8_t> &packets, const PMT &pmt);
+    void AddPackets(std::vector<uint8_t> &packets, const PMT &pmt, bool packetsMaybeNotEndAtUnitStart);
     void ClearFragments();
     const std::vector<uint8_t> &GetFragments() const { return m_fragments; }
     const std::vector<size_t> &GetFragmentSizes() const { return m_fragmentSizes; }
