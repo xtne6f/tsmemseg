@@ -1369,7 +1369,7 @@ bool CMp4Fragmenter::ParseH265Sps(const std::vector<uint8_t> &ebspSps)
 
     int subWC = m_chromaFormatIdc == 1 || m_chromaFormatIdc == 2 ? 2 : 1;
     int subHC = m_chromaFormatIdc == 1 ? 2 : 1;
-    m_codecWidth = picWidthInLumaSamples - (leftOffset - rightOffset) * subWC;
+    m_codecWidth = picWidthInLumaSamples - (leftOffset + rightOffset) * subWC;
     m_codecHeight = picHeightInLumaSamples - (topOffset + bottomOffset) * subHC;
 
     return pos <= lenBits;

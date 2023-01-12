@@ -33,7 +33,9 @@ namespace
 {
 constexpr uint32_t SEGMENT_COUNT_EMPTY = 0x1000000;
 constexpr size_t SEGMENTS_MAX = 100;
+// Minimum number of PES required for MP4 fragmentation
 constexpr int MP4_FRAG_MIN_COUNT = 10;
+// Maximum number of fragments per segment (38 is the configurable maximum)
 constexpr size_t MP4_FRAG_MAX_NUM = 20;
 
 using lock_recursive_mutex = std::lock_guard<std::recursive_mutex>;
@@ -366,9 +368,9 @@ void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONT
     buf[10] = isMp4;
     for (size_t i = segIndex, j = 1; j < segments.size(); ++j) {
         WriteUint32(&buf[j * 16], static_cast<uint32_t>(i));
+        WriteUint32(&buf[j * 16 + 2], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
         WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
         WriteUint32(&buf[j * 16 + 8], segments[i].segDurationMsec);
-        WriteUint32(&buf[j * 16 + 12], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
         for (size_t k = 0; k < segments[i].fragDurationsMsec.size(); ++k) {
             buf.insert(buf.end(), 16, 0);
             WriteUint32(&buf[buf.size() - 16], segments[i].fragDurationsMsec[k]);
@@ -752,7 +754,7 @@ int main(int argc, char **argv)
                 }
             }
 
-            bool forceSegment = packets.size() + 188 > segMaxBytes;
+            bool forceSegment = packets.size() + mp4frag.GetFragments().size() + 188 > segMaxBytes;
             if (isKey || forceSegment ||
                 (isMp4 && markedCountMp4Fragmentation >= 0 &&
                  countMp4Fragmentation >= markedCountMp4Fragmentation + MP4_FRAG_MIN_COUNT / 2))
