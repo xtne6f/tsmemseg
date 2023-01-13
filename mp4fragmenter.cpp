@@ -290,9 +290,9 @@ void CMp4Fragmenter::AddPackets(std::vector<uint8_t> &packets, const PMT &pmt, b
             std::pair<int, int> duration;
             PushMoof(m_fragments, duration, ++m_fragmentCount);
             if (duration.first > 0) {
-                duration.first += m_fragmentDurationResidual;
-                fragDurationMsec = static_cast<int>(static_cast<int64_t>(duration.first) * 1000 / duration.second);
-                m_fragmentDurationResidual = static_cast<int>(static_cast<int64_t>(duration.first) * 1000 % duration.second);
+                int64_t num = static_cast<int64_t>(duration.first) * 1000 + m_fragmentDurationResidual;
+                fragDurationMsec = static_cast<int>(num / duration.second);
+                m_fragmentDurationResidual = static_cast<int>(num % duration.second);
             }
         }
         fragSize = m_fragments.size() - fragSize;
