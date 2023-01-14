@@ -66,13 +66,13 @@ The sequence of 4-7th bytes stores the UNIX time when this list was updated.
 
 Subsequent 16 bytes units contain information about each segment. Newly updated segment is stored backward.
 The 0th byte of the units stores the index of the segment pointed to. The range is between 1 and seg_num.
+2nd stores the number of MP4 fragments in this segment. Information about each fragment can be get by each 16 bytes unit in the extra readable area.
 4-6th stores the sequential number of segment.
 7th stores whether segment is available (0) or unavailable (1).
 8-11th stores the duration of segment in milliseconds.
-12-15th stores the number of MP4 fragments in this segment. Information about each fragment can be get by following each 16 bytes unit.
 
 Information about MP4 fragments (16 bytes units) are placed in the extra readable area.
-The 0-3th byte of the units stores the duration of fragment in milliseconds.
+The 0-3rd byte of the units stores the duration of fragment in milliseconds.
 Besides the fragment information, if there is space in the extra readable area, it is MP4 header box (ftyp/moov).
 
 All other unused bytes are initialized with 0.
@@ -85,6 +85,8 @@ The sequence of 4-6th bytes (immediately after TS-NULL header) stores the sequen
 7th stores whether this segment is available (0) or unavailable (1).
 8-11th stores the number of following 188 bytes units (MPEG-TS) or bytes (MP4). These are the MPEG-TS/MP4 stream itself.
 12th stores whether this segment is MPEG-TS (0) or MP4 (1).
+32-35th, and subsequent 4 bytes units (until its value is 0) store the size of all fragments contained in the stream.
+
 All other unused bytes are initialized with 0.
 
 Notes:

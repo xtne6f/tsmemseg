@@ -146,7 +146,7 @@ CMp4Fragmenter::CMp4Fragmenter()
 {
 }
 
-void CMp4Fragmenter::AddPackets(std::vector<uint8_t> &packets, const PMT &pmt)
+void CMp4Fragmenter::AddPackets(std::vector<uint8_t> &packets, const PMT &pmt, bool packetsMaybeNotEndAtUnitStart)
 {
     int64_t baseVideoDts = -1;
     int64_t baseAudioPts = -1;
@@ -228,15 +228,15 @@ void CMp4Fragmenter::AddPackets(std::vector<uint8_t> &packets, const PMT &pmt)
     std::vector<uint8_t> &pes = m_videoPes.second;
     if (pes.size() >= 6 && pes[0] == 0 && pes[1] == 0 && pes[2] == 1) {
         size_t pesPacketLength = (pes[4] << 8) | pes[5];
-        if (pesPacketLength == 0) {
+        if (pesPacketLength == 0 && !packetsMaybeNotEndAtUnitStart) {
             // Video PES has been accumulated (Assuming packets are split at the unit start.)
             AddVideoPes(pes, pmt.first_video_stream_type == H_265_VIDEO);
             if (baseVideoDts < 0) {
                 baseVideoDts = m_videoDts;
             }
+            pes.clear();
         }
     }
-    pes.clear();
 
     if (m_moov.empty()) {
         if ((pmt.first_video_pid == 0 || m_codecWidth >= 0) &&
@@ -290,9 +290,9 @@ void CMp4Fragmenter::AddPackets(std::vector<uint8_t> &packets, const PMT &pmt)
             std::pair<int, int> duration;
             PushMoof(m_fragments, duration, ++m_fragmentCount);
             if (duration.first > 0) {
-                duration.first += m_fragmentDurationResidual;
-                fragDurationMsec = static_cast<int>(static_cast<int64_t>(duration.first) * 1000 / duration.second);
-                m_fragmentDurationResidual = static_cast<int>(static_cast<int64_t>(duration.first) * 1000 % duration.second);
+                int64_t num = static_cast<int64_t>(duration.first) * 1000 + m_fragmentDurationResidual;
+                fragDurationMsec = static_cast<int>(num / duration.second);
+                m_fragmentDurationResidual = static_cast<int>(num % duration.second);
             }
         }
         fragSize = m_fragments.size() - fragSize;
@@ -377,8 +377,8 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         // Drop SEI
                     }
                     else {
-                        if (h265 ? (nalUnitType == 19 || nalUnitType == 20) : (nalUnitType == 5)) {
-                            // IDR
+                        if (h265 ? (nalUnitType == 19 || nalUnitType == 20 || nalUnitType == 21) : (nalUnitType == 5)) {
+                            // IRAP
                             isKey = true;
                         }
                         sampleSize += 4 + len;
@@ -1369,7 +1369,7 @@ bool CMp4Fragmenter::ParseH265Sps(const std::vector<uint8_t> &ebspSps)
 
     int subWC = m_chromaFormatIdc == 1 || m_chromaFormatIdc == 2 ? 2 : 1;
     int subHC = m_chromaFormatIdc == 1 ? 2 : 1;
-    m_codecWidth = picWidthInLumaSamples - (leftOffset - rightOffset) * subWC;
+    m_codecWidth = picWidthInLumaSamples - (leftOffset + rightOffset) * subWC;
     m_codecHeight = picHeightInLumaSamples - (topOffset + bottomOffset) * subHC;
 
     return pos <= lenBits;
