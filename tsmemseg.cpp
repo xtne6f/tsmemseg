@@ -102,6 +102,7 @@ struct SEGMENT_CONTEXT
     std::vector<uint8_t> backBuf;
     uint32_t segCount;
     int segDurationMsec;
+    int64_t segTimeMsec;
     std::vector<int> fragDurationsMsec;
 };
 
@@ -371,6 +372,7 @@ void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONT
         WriteUint32(&buf[j * 16 + 2], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
         WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
         WriteUint32(&buf[j * 16 + 8], segments[i].segDurationMsec);
+        WriteUint32(&buf[j * 16 + 12], static_cast<uint32_t>(segments[i].segTimeMsec / 10));
         for (size_t k = 0; k < segments[i].fragDurationsMsec.size(); ++k) {
             buf.insert(buf.end(), 16, 0);
             WriteUint32(&buf[buf.size() - 16], segments[i].fragDurationsMsec[k]);
@@ -626,6 +628,7 @@ int main(int argc, char **argv)
     unsigned int syncError = 0;
     unsigned int forcedSegmentationError = 0;
     int64_t entireDurationMsec = 0;
+    int64_t entireDurationFromBaseMsec = 0;
     int64_t durationMsecResidual = 0;
     int64_t pts = -1;
     int64_t lastPts = -1;
@@ -658,12 +661,12 @@ int main(int argc, char **argv)
                 readRatePerMille = nextReadRatePerMille;
                 // Rebase
                 baseTick = nowTick;
-                entireDurationMsec = 0;
+                entireDurationFromBaseMsec = 0;
             }
             if (readRatePerMille > 0) {
                 // Check reading speed
                 int64_t ptsDiff = (0x200000000 + pts - lastPts) & 0x1ffffffff;
-                if (ptsDiff < 0x100000000 && entireDurationMsec + ptsDiff / 90 > (nowTick - baseTick) * readRatePerMille / 1000) {
+                if (ptsDiff < 0x100000000 && entireDurationFromBaseMsec + ptsDiff / 90 > (nowTick - baseTick) * readRatePerMille / 1000) {
                     // Too fast
                     SleepFor(std::chrono::milliseconds(10));
                     continue;
@@ -833,9 +836,11 @@ int main(int argc, char **argv)
                     }
                     segIncomplete = !isKey && !forceSegment;
                     seg.segDurationMsec = static_cast<int>((ptsDiff + durationMsecResidual) / 90);
+                    seg.segTimeMsec = entireDurationMsec;
                     if (!segIncomplete) {
                         durationMsecResidual = (ptsDiff + durationMsecResidual) % 90;
                         entireDurationMsec += seg.segDurationMsec;
+                        entireDurationFromBaseMsec += seg.segDurationMsec;
                         lastPts = pts;
                         targetDurationMsec = nextTargetDurationMsec;
                     }

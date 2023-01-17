@@ -61,10 +61,11 @@ The sequence of 4-7th bytes stores the UNIX time when this list was updated.
 
 Subsequent 16 bytes units contain information about each segment. Newly updated segment is stored backward.
 The 0th byte of the units stores the index of the segment pointed to. The range is between 1 and seg_num.
-2nd stores the number of MP4 fragments in this segment. Information about each fragment can be get by each 16 bytes unit in the extra readable area.
+2nd stores the number of MP4 fragments in this segment. Information about each fragment can be got from each 16 bytes unit (explained later) in the extra readable area.
 4-6th stores the sequential number of segment.
 7th stores whether segment is available (0) or unavailable (1).
 8-11th stores the duration of segment in milliseconds.
+12-15th stores sum of all past segment durations up to this segment in 10-milliseconds.
 
 Information about MP4 fragments (16 bytes units) are placed in the extra readable area.
 The 0-3rd byte of the units stores the duration of fragment in milliseconds.
