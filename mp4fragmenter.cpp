@@ -288,7 +288,7 @@ void CMp4Fragmenter::AddPackets(const std::vector<uint8_t> &packets, const PMT &
             }
 
             std::pair<int, int> duration;
-            PushMoof(m_fragments, duration, ++m_fragmentCount);
+            PushMoof(m_fragments, duration, m_fragmentCount);
             if (duration.first > 0) {
                 int64_t num = static_cast<int64_t>(duration.first) * 1000 + m_fragmentDurationResidual;
                 fragDurationMsec = static_cast<int>(num / duration.second);
@@ -403,8 +403,10 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                 VIDEO_SAMPLE_INFO info;
                 info.sampleSize = static_cast<uint32_t>(sampleSize);
                 info.isKey = isKey;
-                info.sampleDuration = lastDts < 0 ? -1 : static_cast<int>(m_videoDts - lastDts);
-                info.compositionTimeOffsets = std::max(static_cast<int>(m_videoPts - m_videoDts), 0);
+                int64_t diff = (0x200000000 + m_videoDts - lastDts) & 0x1ffffffff;
+                info.sampleDuration = lastDts < 0 || diff > 900000 ? -1 : static_cast<int>(diff);
+                diff = (0x200000000 + m_videoPts - m_videoDts) & 0x1ffffffff;
+                info.compositionTimeOffsets = diff > 900000 ? 0 : static_cast<int>(diff);
                 m_videoSampleInfos.push_back(info);
             }
         }
@@ -854,30 +856,29 @@ void CMp4Fragmenter::PushMoov(std::vector<uint8_t> &data) const
     });
 }
 
-void CMp4Fragmenter::PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &fragDuration, uint32_t fragCount) const
+void CMp4Fragmenter::PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &fragDuration, uint32_t &fragCount) const
 {
-    size_t moofBegin = data.size();
-    size_t videoOffsetFieldPos = 0;
-    size_t audioOffsetFieldPos = 0;
     fragDuration.first = 0;
     fragDuration.second = 1;
 
-    PushBox(data, "moof", [this, fragCount, &fragDuration, &videoOffsetFieldPos, &audioOffsetFieldPos](std::vector<uint8_t> &data) {
-        PushFullBox(data, "mfhd", 0x00000000, [fragCount](std::vector<uint8_t> &data) {
-            PushUint(data, fragCount);
-        });
-
-        if (!m_videoSampleInfos.empty()) {
-            PushBox(data, "traf", [this, &fragDuration, &videoOffsetFieldPos](std::vector<uint8_t> &data) {
+    if (!m_videoSampleInfos.empty()) {
+        size_t moofBegin = data.size();
+        size_t offsetFieldPos = 0;
+        ++fragCount;
+        PushBox(data, "moof", [this, fragCount, &fragDuration, &offsetFieldPos](std::vector<uint8_t> &data) {
+            PushFullBox(data, "mfhd", 0x00000000, [fragCount](std::vector<uint8_t> &data) {
+                PushUint(data, fragCount);
+            });
+            PushBox(data, "traf", [this, &fragDuration, &offsetFieldPos](std::vector<uint8_t> &data) {
                 PushFullBox(data, "tfhd", 0x00000000, [](std::vector<uint8_t> &data) {
                     PushUint(data, VIDEO_TRACK_ID);
                 });
                 PushFullBox(data, "tfdt", 0x01000000, [this](std::vector<uint8_t> &data) {
                     PushUint64(data, m_videoDecodeTime);
                 });
-                PushFullBox(data, "trun", 0x00000f01, [this, &fragDuration, &videoOffsetFieldPos](std::vector<uint8_t> &data) {
+                PushFullBox(data, "trun", 0x00000f01, [this, &fragDuration, &offsetFieldPos](std::vector<uint8_t> &data) {
                     PushUint(data, static_cast<uint32_t>(m_videoSampleInfos.size()));
-                    videoOffsetFieldPos = data.size();
+                    offsetFieldPos = data.size();
                     PushUint(data, 0);
                     for (auto it = m_videoSampleInfos.begin(); it != m_videoSampleInfos.end(); ++it) {
                         auto itDuration = std::find_if(it, m_videoSampleInfos.end(),
@@ -892,10 +893,23 @@ void CMp4Fragmenter::PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &f
                     }
                 });
             });
-        }
+        });
 
-        if (!m_audioSampleSizes.empty()) {
-            PushBox(data, "traf", [this, &fragDuration, &audioOffsetFieldPos](std::vector<uint8_t> &data) {
+        PushBox(data, "mdat", [this, moofBegin, offsetFieldPos](std::vector<uint8_t> &data) {
+            WriteUint(&data[offsetFieldPos], static_cast<uint32_t>(data.size() - moofBegin));
+            data.insert(data.end(), m_videoMdat.begin(), m_videoMdat.end());
+        });
+    }
+
+    if (!m_audioSampleSizes.empty()) {
+        size_t moofBegin = data.size();
+        size_t offsetFieldPos = 0;
+        ++fragCount;
+        PushBox(data, "moof", [this, fragCount, &fragDuration, &offsetFieldPos](std::vector<uint8_t> &data) {
+            PushFullBox(data, "mfhd", 0x00000000, [fragCount](std::vector<uint8_t> &data) {
+                PushUint(data, fragCount);
+            });
+            PushBox(data, "traf", [this, &fragDuration, &offsetFieldPos](std::vector<uint8_t> &data) {
                 PushFullBox(data, "tfhd", 0x00000028, [](std::vector<uint8_t> &data) {
                     PushUint(data, AUDIO_TRACK_ID);
                     PushUint(data, 1024);
@@ -904,9 +918,9 @@ void CMp4Fragmenter::PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &f
                 PushFullBox(data, "tfdt", 0x01000000, [this](std::vector<uint8_t> &data) {
                     PushUint64(data, m_audioDecodeTime * m_samplingFrequency / 90000);
                 });
-                PushFullBox(data, "trun", 0x00000201, [this, &fragDuration, &audioOffsetFieldPos](std::vector<uint8_t> &data) {
+                PushFullBox(data, "trun", 0x00000201, [this, &fragDuration, &offsetFieldPos](std::vector<uint8_t> &data) {
                     PushUint(data, static_cast<uint32_t>(m_audioSampleSizes.size()));
-                    audioOffsetFieldPos = data.size();
+                    offsetFieldPos = data.size();
                     PushUint(data, 0);
                     for (size_t i = 0; i < m_audioSampleSizes.size(); ++i) {
                         PushUint(data, m_audioSampleSizes[i]);
@@ -917,19 +931,13 @@ void CMp4Fragmenter::PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &f
                     }
                 });
             });
-        }
-    });
+        });
 
-    PushBox(data, "mdat", [this, moofBegin, videoOffsetFieldPos, audioOffsetFieldPos](std::vector<uint8_t> &data) {
-        if (videoOffsetFieldPos) {
-            WriteUint(&data[videoOffsetFieldPos], static_cast<uint32_t>(data.size() - moofBegin));
-            data.insert(data.end(), m_videoMdat.begin(), m_videoMdat.end());
-        }
-        if (audioOffsetFieldPos) {
-            WriteUint(&data[audioOffsetFieldPos], static_cast<uint32_t>(data.size() - moofBegin));
+        PushBox(data, "mdat", [this, moofBegin, offsetFieldPos](std::vector<uint8_t> &data) {
+            WriteUint(&data[offsetFieldPos], static_cast<uint32_t>(data.size() - moofBegin));
             data.insert(data.end(), m_audioMdat.begin(), m_audioMdat.end());
-        }
-    });
+        });
+    }
 }
 
 bool CMp4Fragmenter::ParseSps(const std::vector<uint8_t> &ebspSps)
