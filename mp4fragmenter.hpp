@@ -10,7 +10,7 @@ class CMp4Fragmenter
 {
 public:
     CMp4Fragmenter();
-    void AddPackets(std::vector<uint8_t> &packets, const PMT &pmt, bool packetsMaybeNotEndAtUnitStart);
+    void AddPackets(const std::vector<uint8_t> &packets, const PMT &pmt, bool packetsMaybeNotEndAtUnitStart);
     void ClearFragments();
     const std::vector<uint8_t> &GetFragments() const { return m_fragments; }
     const std::vector<size_t> &GetFragmentSizes() const { return m_fragmentSizes; }
@@ -22,7 +22,7 @@ private:
     void AddAudioPes(const std::vector<uint8_t> &pes);
     void AddID3Pes(const std::vector<uint8_t> &pes);
     void PushMoov(std::vector<uint8_t> &data) const;
-    void PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &fragDuration, uint32_t fragCount) const;
+    void PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &fragDuration, uint32_t &fragCount) const;
     bool ParseSps(const std::vector<uint8_t> &ebspSps);
     bool ParseH265Sps(const std::vector<uint8_t> &ebspSps);
     bool ParseVps(const std::vector<uint8_t> &ebspVps);

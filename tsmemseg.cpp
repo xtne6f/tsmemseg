@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -103,6 +104,7 @@ struct SEGMENT_CONTEXT
     std::vector<uint8_t> backBuf;
     uint32_t segCount;
     int segDurationMsec;
+    int64_t segTimeMsec;
     std::vector<int> fragDurationsMsec;
 };
 
@@ -372,6 +374,7 @@ void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONT
         WriteUint32(&buf[j * 16 + 2], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
         WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
         WriteUint32(&buf[j * 16 + 8], segments[i].segDurationMsec);
+        WriteUint32(&buf[j * 16 + 12], static_cast<uint32_t>(segments[i].segTimeMsec / 10));
         for (size_t k = 0; k < segments[i].fragDurationsMsec.size(); ++k) {
             buf.insert(buf.end(), 16, 0);
             WriteUint32(&buf[buf.size() - 16], segments[i].fragDurationsMsec[k]);
@@ -406,6 +409,235 @@ void WriteSegmentHeader(std::vector<uint8_t> &buf, uint32_t segCount, bool isMp4
 std::vector<uint8_t> &SelectWritableSegmentBuffer(SEGMENT_CONTEXT &seg)
 {
     return !seg.backBuf.empty() || seg.pipes[0].connected || seg.pipes[1].connected ? seg.backBuf : seg.buf;
+}
+
+void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDurationMsec, uint32_t nextTargetDurationMsec,
+                         uint32_t targetFragDurationMsec, size_t segMaxBytes, size_t fragMaxBytes, CID3Converter &id3conv, unsigned int &syncError,
+                         const std::function<bool (int64_t)> &onRead,
+                         const std::function<bool (bool, bool, int64_t, const PMT &, std::vector<uint8_t> &)> &onSegmentOrFragment)
+{
+    // PID of the packet to determine segmentation (Currently this is AVC_VIDEO or H_265_VIDEO)
+    int keyPid = 0;
+    // AVC-NAL's parsing state
+    int nalState = 0;
+    // Counter for fragmentation timing
+    int countFragmentation = 0;
+    // Counter point to create fragment
+    int markedCountFragmentation = -1;
+
+    struct UNIT_START_POSITION
+    {
+        size_t lastPos;
+        // The last unit-start immediately before "keyPid" unit-start
+        size_t beforeKeyStart;
+        // The last unit-start immediately before "keyPid" unit-start marked for fragmentation
+        size_t beforeMarkedKeyStart;
+    };
+    // Map of PID and unit-start position
+    std::unordered_map<int, UNIT_START_POSITION> unitStartMap;
+    // Packets accumulating for next segmentation
+    std::vector<uint8_t> packets;
+    std::vector<uint8_t> backPackets;
+    std::vector<uint8_t> workPackets;
+
+    size_t segBytes = 0;
+    int64_t pts = -1;
+    int64_t lastSegPts = -1;
+    int64_t lastFragPts = -1;
+    int64_t markedFragPts = -1;
+    bool firstAudioPacketArrived = false;
+    bool isFirstKey = true;
+    PAT pat = {};
+    uint8_t buf[188 * 16];
+    size_t bufCount = 0;
+    size_t nRead;
+
+    while ((nRead = fread(buf + bufCount, 1, sizeof(buf) - bufCount, fp)) != 0) {
+        bufCount += nRead;
+
+        if (onRead) {
+            int64_t ptsDiff = (0x200000000 + pts - lastSegPts) & 0x1ffffffff;
+            if (ptsDiff >= 0x100000000) {
+                // PTS went back.
+                ptsDiff = 0;
+            }
+            if (onRead(ptsDiff)) {
+                break;
+            }
+        }
+
+        for (const uint8_t *packet = buf; packet < buf + sizeof(buf) && packet + 188 <= buf + bufCount; packet += 188) {
+            if (extract_ts_header_sync(packet) != 0x47) {
+                // Resynchronization is not implemented.
+                ++syncError;
+                continue;
+            }
+            id3conv.AddPacket(packet);
+        }
+
+        for (auto itPacket = id3conv.GetPackets().cbegin(); itPacket != id3conv.GetPackets().end(); itPacket += 188) {
+            const uint8_t *packet = &*itPacket;
+            int unitStart = extract_ts_header_unit_start(packet);
+            int pid = extract_ts_header_pid(packet);
+            int counter = extract_ts_header_counter(packet);
+            if (unitStart) {
+                UNIT_START_POSITION unitStartPos = {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+                unitStartMap.emplace(pid, unitStartPos).first->second.lastPos = packets.size();
+            }
+            int payloadSize = get_ts_payload_size(packet);
+            const uint8_t *payload = packet + 188 - payloadSize;
+
+            bool isKey = false;
+            if (pid == 0) {
+                extract_pat(&pat, payload, payloadSize, unitStart, counter);
+            }
+            else if (pid == pat.first_pmt.pmt_pid) {
+                extract_pmt(&pat.first_pmt, payload, payloadSize, unitStart, counter);
+            }
+            else if (pid == pat.first_pmt.first_adts_audio_pid) {
+                firstAudioPacketArrived = true;
+            }
+            else if (pid == pat.first_pmt.first_video_pid &&
+                     (pat.first_pmt.first_video_stream_type == AVC_VIDEO ||
+                      pat.first_pmt.first_video_stream_type == H_265_VIDEO)) {
+                bool h265 = pat.first_pmt.first_video_stream_type == H_265_VIDEO;
+                if (unitStart) {
+                    // Defer fragmentation until the arrival of first audio packet.
+                    if (pat.first_pmt.first_adts_audio_pid == 0 || firstAudioPacketArrived) {
+                        ++countFragmentation;
+                    }
+                    bool markForFrag = false;
+                    if (markedCountFragmentation < 0 &&
+                        countFragmentation >= MP4_FRAG_MIN_COUNT &&
+                        ((0x200000000 + pts - lastFragPts) & 0x1ffffffff) / 90 >= targetFragDurationMsec)
+                    {
+                        markForFrag = true;
+                        markedCountFragmentation = countFragmentation;
+                        markedFragPts = pts;
+                    }
+
+                    for (auto it = unitStartMap.begin(); it != unitStartMap.end(); ++it) {
+                        it->second.beforeKeyStart = it->second.lastPos;
+                        if (markForFrag) {
+                            it->second.beforeMarkedKeyStart = it->second.beforeKeyStart;
+                        }
+                    }
+                    keyPid = pid;
+                    nalState = 0;
+                    if (payloadSize >= 9 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1) {
+                        int ptsDtsFlags = payload[7] >> 6;
+                        int pesHeaderLength = payload[8];
+                        if (ptsDtsFlags >= 2 && payloadSize >= 14) {
+                            pts = get_pes_timestamp(payload + 9);
+                            if (lastSegPts < 0) {
+                                lastSegPts = pts;
+                                lastFragPts = pts;
+                            }
+                        }
+                        if (9 + pesHeaderLength < payloadSize) {
+                            if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
+                                isKey = !isFirstKey;
+                                isFirstKey = false;
+                            }
+                        }
+                    }
+                }
+                else if (pid == keyPid) {
+                    if (contains_nal_irap(&nalState, payload, payloadSize, h265)) {
+                        isKey = !isFirstKey;
+                        isFirstKey = false;
+                    }
+                }
+            }
+
+            bool forceSegment = (segMaxBytes != 0 && packets.size() + segBytes + 188 > segMaxBytes) ||
+                                packets.size() + 188 > fragMaxBytes;
+            if (isKey || forceSegment ||
+                (enableFragmentation && markedCountFragmentation >= 0 &&
+                 countFragmentation >= markedCountFragmentation + MP4_FRAG_MIN_COUNT / 2))
+            {
+                int64_t ptsDiff = (0x200000000 + pts - lastSegPts) & 0x1ffffffff;
+                if (ptsDiff >= 0x100000000) {
+                    // PTS went back, rare case.
+                    ptsDiff = 0;
+                }
+                if (!isKey || ptsDiff >= targetDurationMsec * 90) {
+                    workPackets.clear();
+                    backPackets.clear();
+
+                    if (isKey || !forceSegment) {
+                        size_t keyUnitStartPos = isKey ? unitStartMap[keyPid].beforeKeyStart :
+                            unitStartMap[keyPid].beforeMarkedKeyStart;
+                        // Bring PAT and PMT to the front
+                        int bringState = 0;
+                        for (size_t i = 0; i < packets.size() && i < keyUnitStartPos && bringState < 2; i += 188) {
+                            int p = extract_ts_header_pid(&packets[i]);
+                            if (p == 0 || p == pat.first_pmt.pmt_pid) {
+                                bringState = p == 0 ? 1 : bringState == 1 ? 2 : bringState;
+                                workPackets.insert(workPackets.end(), packets.begin() + i, packets.begin() + i + 188);
+                            }
+                        }
+                        bringState = 0;
+                        for (size_t i = 0; i < packets.size(); i += 188) {
+                            if (i < keyUnitStartPos) {
+                                int p = extract_ts_header_pid(&packets[i]);
+                                if ((p == 0 || p == pat.first_pmt.pmt_pid) && bringState < 2) {
+                                    bringState = p == 0 ? 1 : bringState == 1 ? 2 : bringState;
+                                    // Already inserted
+                                }
+                                else {
+                                    auto it = unitStartMap.find(p);
+                                    if (it == unitStartMap.end() ||
+                                        i < std::min(it->second.lastPos, isKey ? it->second.beforeKeyStart : it->second.beforeMarkedKeyStart)) {
+                                        workPackets.insert(workPackets.end(), packets.begin() + i, packets.begin() + i + 188);
+                                    }
+                                    else {
+                                        backPackets.insert(backPackets.end(), packets.begin() + i, packets.begin() + i + 188);
+                                    }
+                                }
+                            }
+                            else {
+                                backPackets.insert(backPackets.end(), packets.begin() + i, packets.begin() + i + 188);
+                            }
+                        }
+                    }
+                    else {
+                        // Packets have been accumulated over the limit, simply segment everything.
+                        workPackets.assign(packets.begin(), packets.end());
+                    }
+                    packets.swap(backPackets);
+
+                    if (!isKey && !forceSegment) {
+                        // fragment
+                        countFragmentation -= markedCountFragmentation;
+                        lastFragPts = markedFragPts;
+                        segBytes += workPackets.size();
+                    }
+                    else {
+                        // segment
+                        countFragmentation = 0;
+                        lastFragPts = pts;
+                        lastSegPts = pts;
+                        targetDurationMsec = nextTargetDurationMsec;
+                        segBytes = 0;
+                    }
+                    markedCountFragmentation = -1;
+
+                    if (onSegmentOrFragment(isKey, forceSegment, ptsDiff, pat.first_pmt, workPackets)) {
+                        return;
+                    }
+                }
+                unitStartMap.clear();
+            }
+            packets.insert(packets.end(), packet, packet + 188);
+        }
+        id3conv.ClearPackets();
+
+        if (bufCount >= 188 && bufCount % 188 != 0) {
+            std::copy(buf + bufCount / 188 * 188, buf + bufCount, buf);
+        }
+        bufCount %= 188;
+    }
 }
 }
 
@@ -482,7 +714,9 @@ int main(int argc, char **argv)
             destName = argv[i];
             for (size_t j = 0; destName[j]; ++j) {
                 c = destName[j];
-                if (j >= 65 || ((c < '0' || '9' < c) && (c < 'A' || 'Z' < c) && (c < 'a' || 'z' < c) && c != '_')) {
+                if (j >= 65 ||
+                    ((j > 0 || c != '-' || destName[1]) &&
+                     (c < '0' || '9' < c) && (c < 'A' || 'Z' < c) && (c < 'a' || 'z' < c) && c != '_')) {
                     destName = "";
                     break;
                 }
@@ -514,6 +748,57 @@ int main(int argc, char **argv)
     }
 #endif
 #endif
+
+    if (destName[0] == '-') {
+        FILE *wfp = stdout;
+#ifdef _WIN32
+        if (_setmode(_fileno(wfp), _O_BINARY) < 0) {
+            fprintf(stderr, "Error: _setmode.\n");
+            return 1;
+        }
+#endif
+        unsigned int syncError = 0;
+        unsigned int forcedSegmentationError = 0;
+        bool wroteHeader = false;
+
+        ProcessSegmentation(fp, isMp4, targetDurationMsec, nextTargetDurationMsec, targetFragDurationMsec, 0, segMaxBytes, id3conv, syncError, nullptr,
+            [&, wfp, isMp4](bool isKey, bool forceSegment, int64_t ptsDiff, const PMT &pmt, std::vector<uint8_t> &packets) -> bool
+        {
+            static_cast<void>(ptsDiff);
+
+            if (!isKey && forceSegment) {
+                ++forcedSegmentationError;
+            }
+            if (isMp4) {
+                mp4frag.AddPackets(packets, pmt, !isKey && forceSegment);
+                if (!wroteHeader && !mp4frag.GetHeader().empty()) {
+                    wroteHeader = true;
+                    if (fwrite(mp4frag.GetHeader().data(), 1, mp4frag.GetHeader().size(), wfp) != mp4frag.GetHeader().size()) {
+                        return true;
+                    }
+                }
+                if (fwrite(mp4frag.GetFragments().data(), 1, mp4frag.GetFragments().size(), wfp) != mp4frag.GetFragments().size()) {
+                    return true;
+                }
+                mp4frag.ClearFragments();
+            }
+            else {
+                if (fwrite(packets.data(), 1, packets.size(), wfp) != packets.size()) {
+                    return true;
+                }
+            }
+            fflush(wfp);
+            return false;
+        });
+
+        if (syncError) {
+            fprintf(stderr, "Warning: %u sync error happened.\n", syncError);
+        }
+        if (forcedSegmentationError) {
+            fprintf(stderr, "Warning: %u forced segmentation happened.\n", forcedSegmentationError);
+        }
+        return 0;
+    }
 
     // segments.front() is segment list, the others are segments.
     std::vector<SEGMENT_CONTEXT> segments;
@@ -604,57 +889,20 @@ int main(int argc, char **argv)
     uint32_t segCount = 0;
     // The last segment is incomplete
     bool segIncomplete = false;
-    // PID of the packet to determine segmentation (Currently this is AVC_VIDEO or H_265_VIDEO)
-    int keyPid = 0;
-    // AVC-NAL's parsing state
-    int nalState = 0;
-    // Counter for MP4 fragmentation timing
-    int countMp4Fragmentation = 0;
-    // Counter point to create MP4 fragment
-    int markedCountMp4Fragmentation = -1;
-
-    struct UNIT_START_POSITION
-    {
-        size_t lastPos;
-        // The last unit-start immediately before "keyPid" unit-start
-        size_t beforeKeyStart;
-        // The last unit-start immediately before "keyPid" unit-start marked for MP4 fragmentation
-        size_t beforeMarkedKeyStart;
-    };
-    // Map of PID and unit-start position
-    std::unordered_map<int, UNIT_START_POSITION> unitStartMap;
-    // Packets accumulating for next segmentation
-    std::vector<uint8_t> packets;
-    std::vector<uint8_t> backPackets;
-    std::vector<uint8_t> workPackets;
 
     unsigned int syncError = 0;
     unsigned int forcedSegmentationError = 0;
     int64_t entireDurationMsec = 0;
+    int64_t entireDurationFromBaseMsec = 0;
     int64_t durationMsecResidual = 0;
-    int64_t pts = -1;
-    int64_t lastPts = -1;
-    int64_t lastFragPts = -1;
-    int64_t markedFragPts = -1;
-    bool firstAudioPacketArrived = false;
-    bool isFirstKey = true;
-    PAT pat = {};
-    uint8_t buf[188 * 16];
-    size_t bufCount = 0;
-    size_t nRead;
 
-    //FILE *fpDebug = fopen("C:\\foo\\bar.mp4", "wb");
-    //bool debugHeader = false;
-
-    while ((nRead = fread(buf + bufCount, 1, sizeof(buf) - bufCount, fp)) != 0) {
-        bufCount += nRead;
-
-        bool accessTimedout = false;
+    ProcessSegmentation(fp, isMp4, targetDurationMsec, nextTargetDurationMsec, targetFragDurationMsec, segMaxBytes, segMaxBytes, id3conv, syncError,
+        [&, accessTimeoutMsec, nextReadRatePerMille](int64_t ptsDiff) -> bool
+    {
         for (;;) {
             int64_t nowTick = GetMsecTick();
             if (accessTimeoutMsec != 0 && static_cast<uint32_t>(nowTick) - lastAccessTick >= accessTimeoutMsec) {
-                accessTimedout = true;
-                break;
+                return true;
             }
             if (readRatePerMille != nextReadRatePerMille &&
                 std::find_if(segments.begin() + 1, segments.end(),
@@ -663,12 +911,11 @@ int main(int argc, char **argv)
                 readRatePerMille = nextReadRatePerMille;
                 // Rebase
                 baseTick = nowTick;
-                entireDurationMsec = 0;
+                entireDurationFromBaseMsec = 0;
             }
             if (readRatePerMille > 0) {
                 // Check reading speed
-                int64_t ptsDiff = (0x200000000 + pts - lastPts) & 0x1ffffffff;
-                if (ptsDiff < 0x100000000 && entireDurationMsec + ptsDiff / 90 > (nowTick - baseTick) * readRatePerMille / 1000) {
+                if (entireDurationFromBaseMsec + ptsDiff / 90 > (nowTick - baseTick) * readRatePerMille / 1000) {
                     // Too fast
                     SleepFor(std::chrono::milliseconds(10));
                     continue;
@@ -676,228 +923,64 @@ int main(int argc, char **argv)
             }
             break;
         }
-        if (accessTimedout) {
-            break;
+        return false;
+    },
+        [&, isMp4, segNum](bool isKey, bool forceSegment, int64_t ptsDiff, const PMT &pmt, std::vector<uint8_t> &packets) -> bool
+    {
+        if (isMp4) {
+            mp4frag.AddPackets(packets, pmt, !isKey && forceSegment);
         }
 
-        for (const uint8_t *packet = buf; packet < buf + sizeof(buf) && packet + 188 <= buf + bufCount; packet += 188) {
-            if (extract_ts_header_sync(packet) != 0x47) {
-                // Resynchronization is not implemented.
-                ++syncError;
-                continue;
-            }
-            id3conv.AddPacket(packet);
+        lock_recursive_mutex lock(bufLock);
+
+        SEGMENT_CONTEXT &seg = segments[segIncomplete ? (segIndex + segNum - 2) % segNum + 1 : segIndex];
+        if (!segIncomplete) {
+            segIndex = segIndex % segNum + 1;
+            seg.segCount = (++segCount) & 0xffffff;
         }
-        for (auto itPacket = id3conv.GetPackets().cbegin(); itPacket != id3conv.GetPackets().end(); itPacket += 188) {
-            const uint8_t *packet = &*itPacket;
-            int unitStart = extract_ts_header_unit_start(packet);
-            int pid = extract_ts_header_pid(packet);
-            int counter = extract_ts_header_counter(packet);
-            if (unitStart) {
-                UNIT_START_POSITION unitStartPos = {SIZE_MAX, SIZE_MAX, SIZE_MAX};
-                unitStartMap.emplace(pid, unitStartPos).first->second.lastPos = packets.size();
-            }
-            int payloadSize = get_ts_payload_size(packet);
-            const uint8_t *payload = packet + 188 - payloadSize;
-
-            bool isKey = false;
-            if (pid == 0) {
-                extract_pat(&pat, payload, payloadSize, unitStart, counter);
-            }
-            else if (pid == pat.first_pmt.pmt_pid) {
-                extract_pmt(&pat.first_pmt, payload, payloadSize, unitStart, counter);
-            }
-            else if (pid == pat.first_pmt.first_adts_audio_pid) {
-                firstAudioPacketArrived = true;
-            }
-            else if (pid == pat.first_pmt.first_video_pid &&
-                     (pat.first_pmt.first_video_stream_type == AVC_VIDEO ||
-                      pat.first_pmt.first_video_stream_type == H_265_VIDEO)) {
-                bool h265 = pat.first_pmt.first_video_stream_type == H_265_VIDEO;
-                if (unitStart) {
-                    // Avoid skipping beginning of video due to lack of information for MP4 header generation.
-                    if (pat.first_pmt.first_adts_audio_pid == 0 || firstAudioPacketArrived) {
-                        ++countMp4Fragmentation;
-                    }
-                    bool markForFrag = false;
-                    if (markedCountMp4Fragmentation < 0 &&
-                        countMp4Fragmentation >= MP4_FRAG_MIN_COUNT &&
-                        ((0x200000000 + pts - lastFragPts) & 0x1ffffffff) / 90 >= targetFragDurationMsec)
-                    {
-                        markForFrag = true;
-                        markedCountMp4Fragmentation = countMp4Fragmentation;
-                        markedFragPts = pts;
-                    }
-
-                    for (auto it = unitStartMap.begin(); it != unitStartMap.end(); ++it) {
-                        it->second.beforeKeyStart = it->second.lastPos;
-                        if (markForFrag) {
-                            it->second.beforeMarkedKeyStart = it->second.beforeKeyStart;
-                        }
-                    }
-                    keyPid = pid;
-                    nalState = 0;
-                    if (payloadSize >= 9 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1) {
-                        int ptsDtsFlags = payload[7] >> 6;
-                        int pesHeaderLength = payload[8];
-                        if (ptsDtsFlags >= 2 && payloadSize >= 14) {
-                            pts = get_pes_timestamp(payload + 9);
-                            if (lastPts < 0) {
-                                lastPts = pts;
-                                lastFragPts = pts;
-                            }
-                        }
-                        if (9 + pesHeaderLength < payloadSize) {
-                            if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
-                                isKey = !isFirstKey;
-                                isFirstKey = false;
-                            }
-                        }
-                    }
-                }
-                else if (pid == keyPid) {
-                    if (contains_nal_irap(&nalState, payload, payloadSize, h265)) {
-                        isKey = !isFirstKey;
-                        isFirstKey = false;
-                    }
-                }
-            }
-
-            bool forceSegment = packets.size() + mp4frag.GetFragments().size() + 188 > segMaxBytes;
-            if (isKey || forceSegment ||
-                (isMp4 && markedCountMp4Fragmentation >= 0 &&
-                 countMp4Fragmentation >= markedCountMp4Fragmentation + MP4_FRAG_MIN_COUNT / 2))
-            {
-                int64_t ptsDiff = (0x200000000 + pts - lastPts) & 0x1ffffffff;
-                if (ptsDiff >= 0x100000000) {
-                    // PTS went back, rare case.
-                    ptsDiff = 0;
-                }
-                if (!isKey || ptsDiff >= targetDurationMsec * 90) {
-                    workPackets.clear();
-                    backPackets.clear();
-
-                    if (isKey || !forceSegment) {
-                        size_t keyUnitStartPos = isKey ? unitStartMap[keyPid].beforeKeyStart :
-                                                         unitStartMap[keyPid].beforeMarkedKeyStart;
-                        // Bring PAT and PMT to the front
-                        int bringState = 0;
-                        for (size_t i = 0; i < packets.size() && i < keyUnitStartPos && bringState < 2; i += 188) {
-                            int p = extract_ts_header_pid(&packets[i]);
-                            if (p == 0 || p == pat.first_pmt.pmt_pid) {
-                                bringState = p == 0 ? 1 : bringState == 1 ? 2 : bringState;
-                                workPackets.insert(workPackets.end(), packets.begin() + i, packets.begin() + i + 188);
-                            }
-                        }
-                        bringState = 0;
-                        for (size_t i = 0; i < packets.size(); i += 188) {
-                            if (i < keyUnitStartPos) {
-                                int p = extract_ts_header_pid(&packets[i]);
-                                if ((p == 0 || p == pat.first_pmt.pmt_pid) && bringState < 2) {
-                                    bringState = p == 0 ? 1 : bringState == 1 ? 2 : bringState;
-                                    // Already inserted
-                                }
-                                else {
-                                    auto it = unitStartMap.find(p);
-                                    if (it == unitStartMap.end() ||
-                                        i < std::min(it->second.lastPos, isKey ? it->second.beforeKeyStart : it->second.beforeMarkedKeyStart)) {
-                                        workPackets.insert(workPackets.end(), packets.begin() + i, packets.begin() + i + 188);
-                                    }
-                                    else {
-                                        backPackets.insert(backPackets.end(), packets.begin() + i, packets.begin() + i + 188);
-                                    }
-                                }
-                            }
-                            else {
-                                backPackets.insert(backPackets.end(), packets.begin() + i, packets.begin() + i + 188);
-                            }
-                        }
-                    }
-                    else {
-                        // Packets have been accumulated over the limit, simply segment everything.
-                        workPackets.assign(packets.begin(), packets.end());
-                        ++forcedSegmentationError;
-                    }
-                    packets.swap(backPackets);
-
-                    if (isMp4) {
-                        mp4frag.AddPackets(workPackets, pat.first_pmt, !isKey && forceSegment);
-                    }
-                    if (!isKey && !forceSegment) {
-                        countMp4Fragmentation -= markedCountMp4Fragmentation;
-                        lastFragPts = markedFragPts;
-                    }
-                    else {
-                        countMp4Fragmentation = 0;
-                        lastFragPts = pts;
-                    }
-                    markedCountMp4Fragmentation = -1;
-
-                    lock_recursive_mutex lock(bufLock);
-
-                    SEGMENT_CONTEXT &seg = segments[segIncomplete ? (segIndex + segNum - 2) % segNum + 1 : segIndex];
-                    if (!segIncomplete) {
-                        segIndex = segIndex % segNum + 1;
-                        seg.segCount = (++segCount) & 0xffffff;
-                    }
-                    segIncomplete = !isKey && !forceSegment;
-                    seg.segDurationMsec = static_cast<int>((ptsDiff + durationMsecResidual) / 90);
-                    if (!segIncomplete) {
-                        durationMsecResidual = (ptsDiff + durationMsecResidual) % 90;
-                        entireDurationMsec += seg.segDurationMsec;
-                        lastPts = pts;
-                        targetDurationMsec = nextTargetDurationMsec;
-                    }
-
-                    std::vector<uint8_t> &segBuf = SelectWritableSegmentBuffer(seg);
-                    segBuf.assign(188, 0);
-
-                    if (isMp4) {
-                        seg.fragDurationsMsec = mp4frag.GetFragmentDurationsMsec();
-                        // Limit the total number of fragments
-                        size_t undeterminedSize = 0;
-                        for (size_t i = seg.fragDurationsMsec.size(); i >= MP4_FRAG_MAX_NUM; --i) {
-                            if (segIncomplete) {
-                                undeterminedSize += mp4frag.GetFragmentSizes()[i - 1];
-                            }
-                            if (i > MP4_FRAG_MAX_NUM) {
-                                seg.fragDurationsMsec[i - 2] += seg.fragDurationsMsec.back();
-                                seg.fragDurationsMsec.pop_back();
-                            }
-                            else if (segIncomplete) {
-                                // In incomplete state, duration of the limited fragment is undetermined, remote it too
-                                seg.fragDurationsMsec.pop_back();
-                            }
-                        }
-                        segBuf.insert(segBuf.end(), mp4frag.GetFragments().begin(), mp4frag.GetFragments().end() - undeterminedSize);
-                    }
-                    else {
-                        segBuf.insert(segBuf.end(), workPackets.begin(), workPackets.end());
-                    }
-
-                    WriteSegmentHeader(segBuf, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
-                    if (!segIncomplete) {
-                        //if (!debugHeader) {
-                        //    debugHeader = true;
-                        //    fwrite(mp4frag.GetHeader().data(), 1, mp4frag.GetHeader().size(), fpDebug);
-                        //}
-                        //fwrite(mp4frag.GetFragments().data(), 1, mp4frag.GetFragments().size(), fpDebug);
-                        mp4frag.ClearFragments();
-                    }
-                    std::vector<uint8_t> &segfrBuf = SelectWritableSegmentBuffer(segments.front());
-                    AssignSegmentList(segfrBuf, segments, segIndex, false, segIncomplete, isMp4, mp4frag.GetHeader());
-                }
-                unitStartMap.clear();
-            }
-            packets.insert(packets.end(), packet, packet + 188);
+        segIncomplete = !isKey && !forceSegment;
+        seg.segDurationMsec = static_cast<int>((ptsDiff + durationMsecResidual) / 90);
+        seg.segTimeMsec = entireDurationMsec;
+        if (!segIncomplete) {
+            durationMsecResidual = (ptsDiff + durationMsecResidual) % 90;
+            entireDurationMsec += seg.segDurationMsec;
+            entireDurationFromBaseMsec += seg.segDurationMsec;
         }
-        id3conv.ClearPackets();
 
-        if (bufCount >= 188 && bufCount % 188 != 0) {
-            std::copy(buf + bufCount / 188 * 188, buf + bufCount, buf);
+        std::vector<uint8_t> &segBuf = SelectWritableSegmentBuffer(seg);
+        segBuf.assign(188, 0);
+
+        if (isMp4) {
+            seg.fragDurationsMsec = mp4frag.GetFragmentDurationsMsec();
+            // Limit the total number of fragments
+            size_t undeterminedSize = 0;
+            for (size_t i = seg.fragDurationsMsec.size(); i >= MP4_FRAG_MAX_NUM; --i) {
+                if (segIncomplete) {
+                    undeterminedSize += mp4frag.GetFragmentSizes()[i - 1];
+                }
+                if (i > MP4_FRAG_MAX_NUM) {
+                    seg.fragDurationsMsec[i - 2] += seg.fragDurationsMsec.back();
+                    seg.fragDurationsMsec.pop_back();
+                }
+                else if (segIncomplete) {
+                    // In incomplete state, duration of the limited fragment is undetermined, remote it too
+                    seg.fragDurationsMsec.pop_back();
+                }
+            }
+            segBuf.insert(segBuf.end(), mp4frag.GetFragments().begin(), mp4frag.GetFragments().end() - undeterminedSize);
         }
-        bufCount %= 188;
-    }
+        else {
+            segBuf.insert(segBuf.end(), packets.begin(), packets.end());
+        }
+
+        WriteSegmentHeader(segBuf, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
+        if (!segIncomplete) {
+            mp4frag.ClearFragments();
+        }
+        std::vector<uint8_t> &segfrBuf = SelectWritableSegmentBuffer(segments.front());
+        AssignSegmentList(segfrBuf, segments, segIndex, false, segIncomplete, isMp4, mp4frag.GetHeader());
+        return false;
+    });
 
     {
         lock_recursive_mutex lock(bufLock);
