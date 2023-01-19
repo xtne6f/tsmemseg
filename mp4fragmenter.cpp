@@ -146,7 +146,7 @@ CMp4Fragmenter::CMp4Fragmenter()
 {
 }
 
-void CMp4Fragmenter::AddPackets(std::vector<uint8_t> &packets, const PMT &pmt, bool packetsMaybeNotEndAtUnitStart)
+void CMp4Fragmenter::AddPackets(const std::vector<uint8_t> &packets, const PMT &pmt, bool packetsMaybeNotEndAtUnitStart)
 {
     int64_t baseVideoDts = -1;
     int64_t baseAudioPts = -1;

@@ -35,8 +35,9 @@ tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrat
   Maximum size of each segment. If segment length exceeds this limit, the segment is forcibly cut whether on a key packet or not.
 
 seg_name
-  Used for the name pattern of named-pipes/FIFOs used to access segments.
-  Available characters are 0-9, A-Z, a-z, '_'. Maximum length is 65.
+  Used for the name pattern of named-pipes/FIFOs used to access segments, or "-" (stdout).
+  If "-" is specified, simply prints stream to standard output. -a -c -r -f -s options are ignored.
+  In other cases, available characters are 0-9, A-Z, a-z, '_'. Maximum length is 65.
   For instance, if "foo123_" is specified, the name pattern of named-pipes/FIFOs is "\\.\pipe\tsmemseg_foo123_??" or "/tmp/tsmemseg_foo123_??.fifo".
 
 Description:
