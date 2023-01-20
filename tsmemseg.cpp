@@ -34,8 +34,6 @@ namespace
 {
 constexpr uint32_t SEGMENT_COUNT_EMPTY = 0x1000000;
 constexpr size_t SEGMENTS_MAX = 100;
-// Minimum number of PES required for MP4 fragmentation
-constexpr int MP4_FRAG_MIN_COUNT = 10;
 // Maximum number of fragments per segment (38 is the configurable maximum)
 constexpr size_t MP4_FRAG_MAX_NUM = 20;
 
@@ -415,14 +413,10 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                          const std::function<bool (int64_t)> &onRead,
                          const std::function<bool (bool, bool, int64_t, const PMT &, std::vector<uint8_t> &)> &onSegmentOrFragment)
 {
-    // PID of the packet to determine segmentation (Currently this is AVC_VIDEO or H_265_VIDEO)
+    // PID of the packet to determine segmentation (AVC_VIDEO or H_265_VIDEO or audio stream)
     int keyPid = 0;
     // AVC-NAL's parsing state
     int nalState = 0;
-    // Counter for fragmentation timing
-    int countFragmentation = 0;
-    // Counter point to create fragment
-    int markedCountFragmentation = -1;
 
     struct UNIT_START_POSITION
     {
@@ -443,6 +437,7 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
     int64_t pts = -1;
     int64_t lastSegPts = -1;
     int64_t lastFragPts = -1;
+    // PTS marking for fragmentation
     int64_t markedFragPts = -1;
     bool firstAudioPacketArrived = false;
     bool isFirstKey = true;
@@ -488,25 +483,33 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
             else if (pid == pat.first_pmt.pmt_pid) {
                 extract_pmt(&pat.first_pmt, payload, payloadSize, unitStart, counter);
             }
+            else if (pid == pat.first_pmt.first_video_pid) {
+                if (unitStart) {
+                    keyPid = pid;
+                }
+            }
             else if (pid == pat.first_pmt.first_adts_audio_pid) {
+                if (unitStart && pat.first_pmt.first_video_pid == 0) {
+                    keyPid = pid;
+                }
                 firstAudioPacketArrived = true;
             }
-            else if (pid == pat.first_pmt.first_video_pid &&
-                     (pat.first_pmt.first_video_stream_type == AVC_VIDEO ||
-                      pat.first_pmt.first_video_stream_type == H_265_VIDEO)) {
+
+            if (keyPid != 0 && pid == keyPid &&
+                (pid == pat.first_pmt.first_adts_audio_pid ||
+                 (pid == pat.first_pmt.first_video_pid &&
+                  (pat.first_pmt.first_video_stream_type == AVC_VIDEO ||
+                   pat.first_pmt.first_video_stream_type == H_265_VIDEO)))) {
                 bool h265 = pat.first_pmt.first_video_stream_type == H_265_VIDEO;
                 if (unitStart) {
-                    // Defer fragmentation until the arrival of first audio packet.
-                    if (pat.first_pmt.first_adts_audio_pid == 0 || firstAudioPacketArrived) {
-                        ++countFragmentation;
-                    }
                     bool markForFrag = false;
-                    if (markedCountFragmentation < 0 &&
-                        countFragmentation >= MP4_FRAG_MIN_COUNT &&
-                        ((0x200000000 + pts - lastFragPts) & 0x1ffffffff) / 90 >= targetFragDurationMsec)
+                    int64_t ptsDiff = (0x200000000 + pts - lastFragPts) & 0x1ffffffff;
+                    // Defer fragmentation until the arrival of first audio packet.
+                    if ((pat.first_pmt.first_adts_audio_pid == 0 || firstAudioPacketArrived) &&
+                        markedFragPts < 0 && lastFragPts >= 0 &&
+                        (ptsDiff < 0x100000000 ? ptsDiff : 0) / 90 >= targetFragDurationMsec)
                     {
                         markForFrag = true;
-                        markedCountFragmentation = countFragmentation;
                         markedFragPts = pts;
                     }
 
@@ -516,8 +519,6 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                             it->second.beforeMarkedKeyStart = it->second.beforeKeyStart;
                         }
                     }
-                    keyPid = pid;
-                    nalState = 0;
                     if (payloadSize >= 9 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1) {
                         int ptsDtsFlags = payload[7] >> 6;
                         int pesHeaderLength = payload[8];
@@ -528,15 +529,23 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                                 lastFragPts = pts;
                             }
                         }
-                        if (9 + pesHeaderLength < payloadSize) {
-                            if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
-                                isKey = !isFirstKey;
-                                isFirstKey = false;
+                        if (pid == pat.first_pmt.first_video_pid) {
+                            nalState = 0;
+                            if (9 + pesHeaderLength < payloadSize) {
+                                if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
+                                    isKey = !isFirstKey;
+                                    isFirstKey = false;
+                                }
                             }
+                        }
+                        else {
+                            // Always treat as key.
+                            isKey = !isFirstKey;
+                            isFirstKey = false;
                         }
                     }
                 }
-                else if (pid == keyPid) {
+                else if (pid == pat.first_pmt.first_video_pid) {
                     if (contains_nal_irap(&nalState, payload, payloadSize, h265)) {
                         isKey = !isFirstKey;
                         isFirstKey = false;
@@ -546,16 +555,18 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
 
             bool forceSegment = (segMaxBytes != 0 && packets.size() + segBytes + 188 > segMaxBytes) ||
                                 packets.size() + 188 > fragMaxBytes;
-            if (isKey || forceSegment ||
-                (enableFragmentation && markedCountFragmentation >= 0 &&
-                 countFragmentation >= markedCountFragmentation + MP4_FRAG_MIN_COUNT / 2))
-            {
+            // Avoid making the last fragment too small.
+            int64_t markedPtsDiff = (0x200000000 + pts - markedFragPts) & 0x1ffffffff;
+            bool createFragment = enableFragmentation && markedFragPts >= 0 &&
+                                  (markedPtsDiff < 0x100000000 ? markedPtsDiff : 0) / 90 >= targetFragDurationMsec / 4;
+            if (isKey || forceSegment || createFragment) {
                 int64_t ptsDiff = (0x200000000 + pts - lastSegPts) & 0x1ffffffff;
                 if (ptsDiff >= 0x100000000) {
                     // PTS went back, rare case.
                     ptsDiff = 0;
                 }
-                if (!isKey || ptsDiff >= targetDurationMsec * 90) {
+                bool isSegmentKey = isKey && ptsDiff >= targetDurationMsec * 90;
+                if (isSegmentKey || forceSegment || createFragment) {
                     workPackets.clear();
                     backPackets.clear();
 
@@ -601,27 +612,25 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                     }
                     packets.swap(backPackets);
 
-                    if (!isKey && !forceSegment) {
+                    if (!isSegmentKey && !forceSegment) {
                         // fragment
-                        countFragmentation -= markedCountFragmentation;
                         lastFragPts = markedFragPts;
                         segBytes += workPackets.size();
                     }
                     else {
                         // segment
-                        countFragmentation = 0;
                         lastFragPts = pts;
                         lastSegPts = pts;
                         targetDurationMsec = nextTargetDurationMsec;
                         segBytes = 0;
                     }
-                    markedCountFragmentation = -1;
+                    markedFragPts = -1;
 
-                    if (onSegmentOrFragment(isKey, forceSegment, ptsDiff, pat.first_pmt, workPackets)) {
+                    if (onSegmentOrFragment(isSegmentKey, forceSegment, ptsDiff, pat.first_pmt, workPackets)) {
                         return;
                     }
+                    unitStartMap.clear();
                 }
-                unitStartMap.clear();
             }
             packets.insert(packets.end(), packet, packet + 188);
         }
@@ -637,7 +646,7 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
 int main(int argc, char **argv)
 {
     bool isMp4 = false;
-    uint32_t targetDurationMsec = 0;
+    uint32_t targetDurationMsec = 1000;
     uint32_t nextTargetDurationMsec = 2000;
     uint32_t targetFragDurationMsec = 500;
     uint32_t accessTimeoutMsec = 10000;

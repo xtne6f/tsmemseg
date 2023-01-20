@@ -1,4 +1,4 @@
-tsmemseg - In-memory transport stream segmenter mainly for HLS
+tsmemseg - In-memory transport stream segmenter mainly for HLS/LL-HLS
 
 Usage:
 
@@ -7,8 +7,8 @@ tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrat
 -4
   Convert to fragmented MP4.
 
--i inittime (seconds), 0<=range<=60, default=0
-  Initial segment duration. Segment is cut on a key (NAL-IDR) packet.
+-i inittime (seconds), 0<=range<=60, default=1
+  Initial segment duration. Segment is cut on a key (NAL-IRAP) packet.
 
 -t time (seconds), 0<=range<=60, default=2
   Duration other than the initial segment.
@@ -43,7 +43,7 @@ seg_name
 Description:
 
 Standard input to this tool is assumed to be an MPEG transport stream which contains a single PMT stream, and a single MPEG-4 AVC / HEVC video stream
-with appropriate keyframe interval. This is such as a stream that is encoded using FFmpeg.
+with appropriate keyframe interval and/or a single ADTS audio stream. This is such as a stream that is encoded using FFmpeg.
 This tool does not output any files. Users can access each segment via Windows named-pipe or Unix FIFO (typically, using fopen("rb")).
 Information corresponding to HLS playlist file (.m3u8) can be obtained via "\\.\pipe\tsmemseg_{seg_name}00" or "/tmp/tsmemseg_{seg_name}00.fifo". (hereinafter "listing pipe")
 Actual segment data (MPEG-TS or fragmented MP4) can be obtained via between "tsmemseg_{seg_name}01" and "tsmemseg_{seg_name}{seg_num}". (hereinafter "segment pipe")
