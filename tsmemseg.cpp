@@ -442,14 +442,20 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
     bool firstAudioPacketArrived = false;
     bool isFirstKey = true;
     PAT pat = {};
-    uint8_t buf[188 * 16];
+    int countForOnRead = 0;
+    uint8_t buf[188];
     size_t bufCount = 0;
     size_t nRead;
 
     while ((nRead = fread(buf + bufCount, 1, sizeof(buf) - bufCount, fp)) != 0) {
         bufCount += nRead;
+        if (bufCount < sizeof(buf)) {
+            continue;
+        }
+        bufCount = 0;
 
-        if (onRead) {
+        if (onRead && ++countForOnRead == 16) {
+            countForOnRead = 0;
             int64_t ptsDiff = (0x200000000 + pts - lastSegPts) & 0x1ffffffff;
             if (ptsDiff >= 0x100000000) {
                 // PTS went back.
@@ -460,12 +466,14 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
             }
         }
 
-        for (const uint8_t *packet = buf; packet < buf + sizeof(buf) && packet + 188 <= buf + bufCount; packet += 188) {
-            if (extract_ts_header_sync(packet) != 0x47) {
-                // Resynchronization is not implemented.
-                ++syncError;
-                continue;
-            }
+        if (extract_ts_header_sync(buf) != 0x47) {
+            // Resynchronization is not implemented.
+            ++syncError;
+            continue;
+        }
+
+        {
+            const uint8_t *packet = buf;
             int unitStart = extract_ts_header_unit_start(packet);
             int pid = extract_ts_header_pid(packet);
             int counter = extract_ts_header_counter(packet);
@@ -634,11 +642,6 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
             }
             packets.insert(packets.end(), packet, packet + 188);
         }
-
-        if (bufCount >= 188 && bufCount % 188 != 0) {
-            std::copy(buf + bufCount / 188 * 188, buf + bufCount, buf);
-        }
-        bufCount %= 188;
     }
 }
 }
