@@ -62,12 +62,22 @@ template<class P>
 void ParseNals(const uint8_t *payload, size_t payloadSize, P onNalProc)
 {
     size_t nalPos = 0;
-    for (size_t i = 0; i + 1 < payloadSize; ++i) {
-        if (i + 2 == payloadSize || (payload[i] == 0 && payload[i + 1] == 0 && payload[i + 2] == 1)) {
+    for (size_t i = 2;;) {
+        if (i >= payloadSize || (payload[i] == 1 && payload[i - 1] == 0 && payload[i - 2] == 0)) {
             if (nalPos != 0) {
-                onNalProc(payload + nalPos, (i + 2 == payloadSize ? payloadSize : i - (payload[i - 1] == 0)) - nalPos);
+                onNalProc(payload + nalPos, (i >= payloadSize ? payloadSize : i - 2 - (payload[i - 3] == 0)) - nalPos);
             }
-            nalPos = i + 3;
+            if (i >= payloadSize) {
+                break;
+            }
+            nalPos = i + 1;
+            i += 3;
+        }
+        else if (payload[i] > 0) {
+            i += 3;
+        }
+        else {
+            ++i;
         }
     }
 }
