@@ -391,6 +391,22 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                             // IRAP (BLA or CRA or IDR)
                             isKey = true;
                         }
+                        else if (!h265 && nalUnitType == 1) {
+                            // Non-IDR
+                            // Emulation prevention should not appear unless first_mb_in_slice value is huge
+                            if (len >= 5 && (nal[1] != 0 || nal[2] != 0 || nal[3] != 3)) {
+                                uint8_t sliceIntro[16] = {};
+                                std::copy(nal + 1, nal + 5, sliceIntro);
+                                size_t pos = 0;
+                                // first_mb_in_slice
+                                ReadUegBits(sliceIntro, pos);
+                                int sliceType = ReadUegBits(sliceIntro, pos);
+                                if (sliceType == 2 || sliceType == 4 || sliceType == 7 || sliceType == 9) {
+                                    // I or SI picture
+                                    isKey = true;
+                                }
+                            }
+                        }
                         sampleSize += 4 + len;
                         PushUint(m_videoMdat, static_cast<uint32_t>(len));
                         m_videoMdat.insert(m_videoMdat.end(), nal, nal + len);

@@ -45,7 +45,7 @@ uint32_t calc_crc32(const uint8_t *data, int data_size, uint32_t crc = 0xfffffff
 int extract_psi(PSI *psi, const uint8_t *payload, int payload_size, int unit_start, int counter);
 void extract_pat(PAT *pat, const uint8_t *payload, int payload_size, int unit_start, int counter);
 void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_start, int counter);
-int contains_nal_irap(int *nal_state, const uint8_t *payload, int payload_size, bool h_265);
+int contains_nal_idr_or_cra(int *nal_state, const uint8_t *payload, int payload_size, bool h_265);
 int get_ts_payload_size(const uint8_t *packet);
 int64_t get_pes_timestamp(const uint8_t *data_5bytes);
 

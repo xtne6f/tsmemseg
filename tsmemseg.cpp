@@ -540,7 +540,7 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                         if (pid == pat.first_pmt.first_video_pid) {
                             nalState = 0;
                             if (9 + pesHeaderLength < payloadSize) {
-                                if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
+                                if (contains_nal_idr_or_cra(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
                                     isKey = !isFirstKey;
                                     isFirstKey = false;
                                 }
@@ -554,7 +554,7 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                     }
                 }
                 else if (pid == pat.first_pmt.first_video_pid) {
-                    if (contains_nal_irap(&nalState, payload, payloadSize, h265)) {
+                    if (contains_nal_idr_or_cra(&nalState, payload, payloadSize, h265)) {
                         isKey = !isFirstKey;
                         isFirstKey = false;
                     }
