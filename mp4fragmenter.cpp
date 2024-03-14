@@ -387,7 +387,7 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         // Drop SEI
                     }
                     else {
-                        if (h265 ? (nalUnitType >= 16 || nalUnitType <= 21) : (nalUnitType == 5)) {
+                        if (h265 ? (nalUnitType >= 16 && nalUnitType <= 21) : (nalUnitType == 5)) {
                             // IRAP (BLA or CRA or IDR)
                             isKey = true;
                         }
