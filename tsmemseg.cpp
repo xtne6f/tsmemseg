@@ -387,7 +387,7 @@ void WriteSegmentHeader(std::vector<uint8_t> &buf, uint32_t segCount, bool isMp4
 {
     // NULL TS header
     buf[0] = 0x47;
-    buf[1] = 0x01;
+    buf[1] = 0x1f;
     buf[2] = 0xff;
     buf[3] = 0x10;
     WriteUint32(&buf[4], segCount);
@@ -542,7 +542,7 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                         if (pid == pat.first_pmt.first_video_pid) {
                             nalState = 0;
                             if (9 + pesHeaderLength < payloadSize) {
-                                if (contains_nal_irap(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
+                                if (contains_nal_idr_or_cra(&nalState, payload + 9 + pesHeaderLength, payloadSize - (9 + pesHeaderLength), h265)) {
                                     isKey = !isFirstKey;
                                     isFirstKey = false;
                                 }
@@ -556,7 +556,7 @@ void ProcessSegmentation(FILE *fp, bool enableFragmentation, uint32_t targetDura
                     }
                 }
                 else if (pid == pat.first_pmt.first_video_pid) {
-                    if (contains_nal_irap(&nalState, payload, payloadSize, h265)) {
+                    if (contains_nal_idr_or_cra(&nalState, payload, payloadSize, h265)) {
                         isKey = !isFirstKey;
                         isFirstKey = false;
                     }

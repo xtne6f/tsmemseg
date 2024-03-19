@@ -149,7 +149,7 @@ void extract_pmt(PMT *pmt, const uint8_t *payload, int payload_size, int unit_st
     while (!done);
 }
 
-int contains_nal_irap(int *nal_state, const uint8_t *payload, int payload_size, bool h_265)
+int contains_nal_idr_or_cra(int *nal_state, const uint8_t *payload, int payload_size, bool h_265)
 {
     for (int i = 0; i < payload_size; ++i) {
         // 0,1,2: Searching for NAL start code

@@ -62,12 +62,22 @@ template<class P>
 void ParseNals(const uint8_t *payload, size_t payloadSize, P onNalProc)
 {
     size_t nalPos = 0;
-    for (size_t i = 0; i + 1 < payloadSize; ++i) {
-        if (i + 2 == payloadSize || (payload[i] == 0 && payload[i + 1] == 0 && payload[i + 2] == 1)) {
+    for (size_t i = 2;;) {
+        if (i >= payloadSize || (payload[i] == 1 && payload[i - 1] == 0 && payload[i - 2] == 0)) {
             if (nalPos != 0) {
-                onNalProc(payload + nalPos, (i + 2 == payloadSize ? payloadSize : i - (payload[i - 1] == 0)) - nalPos);
+                onNalProc(payload + nalPos, (i >= payloadSize ? payloadSize : i - 2 - (payload[i - 3] == 0)) - nalPos);
             }
-            nalPos = i + 3;
+            if (i >= payloadSize) {
+                break;
+            }
+            nalPos = i + 1;
+            i += 3;
+        }
+        else if (payload[i] > 0) {
+            i += 3;
+        }
+        else {
+            ++i;
         }
     }
 }
@@ -377,9 +387,25 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         // Drop SEI
                     }
                     else {
-                        if (h265 ? (nalUnitType == 19 || nalUnitType == 20 || nalUnitType == 21) : (nalUnitType == 5)) {
-                            // IRAP
+                        if (h265 ? (nalUnitType >= 16 && nalUnitType <= 21) : (nalUnitType == 5)) {
+                            // IRAP (BLA or CRA or IDR)
                             isKey = true;
+                        }
+                        else if (!h265 && nalUnitType == 1) {
+                            // Non-IDR
+                            // Emulation prevention should not appear unless first_mb_in_slice value is huge
+                            if (len >= 5 && (nal[1] != 0 || nal[2] != 0 || nal[3] != 3)) {
+                                uint8_t sliceIntro[16] = {};
+                                std::copy(nal + 1, nal + 5, sliceIntro);
+                                size_t pos = 0;
+                                // first_mb_in_slice
+                                ReadUegBits(sliceIntro, pos);
+                                int sliceType = ReadUegBits(sliceIntro, pos);
+                                if (sliceType == 2 || sliceType == 4 || sliceType == 7 || sliceType == 9) {
+                                    // I or SI picture
+                                    isKey = true;
+                                }
+                            }
                         }
                         sampleSize += 4 + len;
                         PushUint(m_videoMdat, static_cast<uint32_t>(len));
