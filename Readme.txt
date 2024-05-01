@@ -2,7 +2,7 @@ tsmemseg - In-memory transport stream segmenter mainly for HLS/LL-HLS
 
 Usage:
 
-tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-d flags] seg_name
+tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-g dir][-d flags] seg_name
 
 -4
   Convert to fragmented MP4.
@@ -33,6 +33,10 @@ tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrat
 
 -m max_kbytes (kbytes), 32<=range<=32768, default=4096
   Maximum size of each segment. If segment length exceeds this limit, the segment is forcibly cut whether on a key packet or not.
+
+-g dir, default=""
+  Specify the directory for creating FIFOs. If not specified, created in "/tmp" with 0600 permission.
+  This option is ignored on Windows.
 
 -d flags, range=0 or 1 or 3, default=0
   Convert ARIB caption/superimpose streams to an ID3 timed-metadata stream that https://github.com/monyone/aribb24.js can recognize.
@@ -77,7 +81,33 @@ Information about MP4 fragments (16 bytes units) are placed in the extra readabl
 The 0-3rd byte of the units stores the duration of fragment in milliseconds.
 Besides the fragment information, if there is space in the extra readable area, it is MP4 header box (ftyp/moov).
 
+For Unix FIFO only, there is a 64-bytes field preceding the information units to store the seg_name.
+The field can be used as a signature to prevent multiple processes from reading the FIFO in a race condition.
+
 All other unused bytes are initialized with 0.
+
+ 0         1 2        3 4 5 6             7           8                 9          0   1 2 3 4 5
++----------------------+-----------------------------+----------------------------------+-----------------+
+|seg_name field (Unix FIFO only)                                                                          :
++----------------------+-----------------------------+----------------------------------+-----------------+
+:                                                                                                         :
++----------------------+-----------------------------+----------------------------------+-----------------+
+:                                                                                                         :
++----------------------+-----------------------------+----------------------------------+-----------------+
+:                                                                                                         |
++----------------------+-----------------------------+----------------------------------+-----------------+
+|seg_num   0 0        0|UNIX_time_updated            |no_longer_updated incomplete MP4 0|extra_area_length|
++----------------------+-----------------------------+----------------------------------+-----------------+
+|seg_index 0 frag_num 0|sequential_number unavailable|seg_duration_msec                 |sum_of_durations |
++----------------------+-----------------------------+----------------------------------+-----------------+
+...
++----------------------+-----------------------------+----------------------------------+-----------------+
+|frag_duration_msec    |0 0 0             0          |0                 0          0   0|0 0 0 0          |
++----------------------+-----------------------------+----------------------------------+-----------------+
+...
++----------------------+-----------------------------+----------------------------------+-----------------+
+|ftyp/moov                                                                                                :
+...
 
 Specification of "segment pipe":
 
@@ -89,7 +119,30 @@ The sequence of 4-6th bytes (immediately after TS-NULL header) stores the sequen
 12th stores whether this segment is MPEG-TS (0) or MP4 (1).
 32-35th, and subsequent 4 bytes units (until its value is 0) store the size of all fragments contained in the stream.
 
+For Unix FIFO only, there is a 188-bytes field preceding the information packet to store the seg_name.
+
 All other unused bytes are initialized with 0.
+
+ 0    1    2    3    4 5 6             7           8 9 0 1                  2   3 4 5
+(The following 188 bytes are Unix FIFO only)
++-------------------+-----------------------------+------------------------+-----------+
+|0x47 0x1f 0xff 0x10|seg_name field                                                    :
+...(188 bytes)
++-------------------+-----------------------------+------------------------+-----------+
+|0x47 0x1f 0xff 0x10|sequential_number unavailable|number_of_units_or_bytes|MP4 0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|0    0    0    0   |0 0 0             0          |0 0 0 0                 |0   0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|0    0    0    0   |0 0 0             0          |0 0 0 0                 |0   0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|0    0    0    0   |0 0 0             0          |0 0 0 0                 |0   0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|frag_size_0        |frag_size_1                  |frag_size_2             |frag_size_3|
++-------------------+-----------------------------+------------------------+-----------+
+...(188 bytes)
++-------------------+-----------------------------+------------------------+-----------+
+|MPEG-TS/MP4 stream                                                                    :
+...
 
 Notes:
 
