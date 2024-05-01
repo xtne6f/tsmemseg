@@ -2,7 +2,7 @@ tsmemseg - In-memory transport stream segmenter mainly for HLS/LL-HLS
 
 Usage:
 
-tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes] seg_name
+tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-g dir] seg_name
 
 -4
   Convert to fragmented MP4.
@@ -33,6 +33,10 @@ tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrat
 
 -m max_kbytes (kbytes), 32<=range<=32768, default=4096
   Maximum size of each segment. If segment length exceeds this limit, the segment is forcibly cut whether on a key packet or not.
+
+-g dir, default=""
+  Specify the directory for creating FIFOs. If not specified, created in "/tmp" with 0600 permission.
+  This option is ignored on Windows.
 
 seg_name
   Used for the name pattern of named-pipes/FIFOs used to access segments, or "-" (stdout).

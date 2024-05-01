@@ -7,6 +7,7 @@
 #else
 #include <errno.h>
 #include <signal.h>
+#include <string.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -95,7 +96,7 @@ struct SEGMENT_PIPE_CONTEXT
 
 struct SEGMENT_CONTEXT
 {
-    char path[128];
+    char path[256];
     SEGMENT_PIPE_CONTEXT pipes[2];
     std::vector<uint8_t> buf;
     std::vector<uint8_t> backBuf;
@@ -677,6 +678,9 @@ int main(int argc, char **argv)
     int nextReadRatePerMille = 0;
     size_t segNum = 8;
     size_t segMaxBytes = 4096 * 1024;
+#ifndef _WIN32
+    const char *fifoDir = "";
+#endif
     const char *destName = "";
     CMp4Fragmenter mp4frag;
 
@@ -686,7 +690,7 @@ int main(int argc, char **argv)
             c = argv[i][1];
         }
         if (c == 'h') {
-            fprintf(stderr, "Usage: tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes] seg_name\n");
+            fprintf(stderr, "Usage: tsmemseg [-4][-i inittime][-t time][-p ptime][-a acc_timeout][-c cmd][-r readrate][-f fill_readrate][-s seg_num][-m max_kbytes][-g dir] seg_name\n");
             return 2;
         }
         bool invalid = false;
@@ -728,6 +732,12 @@ int main(int argc, char **argv)
             else if (c == 'm') {
                 segMaxBytes = static_cast<size_t>(strtol(argv[++i], nullptr, 10) * 1024);
                 invalid = segMaxBytes < 32 * 1024 || 32 * 1024 * 1024 < segMaxBytes;
+            }
+            else if (c == 'g') {
+                ++i;
+#ifndef _WIN32
+                fifoDir = argv[i];
+#endif
             }
         }
         else {
@@ -851,8 +861,15 @@ int main(int argc, char **argv)
             break;
         }
 #else
-        sprintf(seg.path, "/tmp/tsmemseg_%s%02d.fifo", destName, static_cast<int>(segments.size()));
-        if (mkfifo(seg.path, S_IRWXU) != 0) {
+        size_t dirLen = strlen(fifoDir);
+        if ((dirLen ? dirLen + (fifoDir[dirLen - 1] != '/' ? 1 : 0) : 5) + strlen(destName) + 16 >= sizeof(seg.path)) {
+            // path too long
+            break;
+        }
+        sprintf(seg.path, "%s%stsmemseg_%s%02d.fifo", dirLen ? fifoDir : "/tmp/",
+                                                      dirLen && fifoDir[dirLen - 1] != '/' ? "/" : "",
+                                                      destName, static_cast<int>(segments.size()));
+        if (mkfifo(seg.path, S_IRUSR + S_IWUSR + (dirLen ? S_IRGRP + S_IWGRP + S_IROTH + S_IWOTH : 0)) != 0) {
             break;
         }
 #endif
