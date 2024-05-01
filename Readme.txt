@@ -72,7 +72,33 @@ Information about MP4 fragments (16 bytes units) are placed in the extra readabl
 The 0-3rd byte of the units stores the duration of fragment in milliseconds.
 Besides the fragment information, if there is space in the extra readable area, it is MP4 header box (ftyp/moov).
 
+For Unix FIFO only, there is a 64-bytes field preceding the information units to store the seg_name.
+The field can be used as a signature to prevent multiple processes from reading the FIFO in a race condition.
+
 All other unused bytes are initialized with 0.
+
+ 0         1 2        3 4 5 6             7           8                 9          0   1 2 3 4 5
++----------------------+-----------------------------+----------------------------------+-----------------+
+|seg_name field (Unix FIFO only)                                                                          :
++----------------------+-----------------------------+----------------------------------+-----------------+
+:                                                                                                         :
++----------------------+-----------------------------+----------------------------------+-----------------+
+:                                                                                                         :
++----------------------+-----------------------------+----------------------------------+-----------------+
+:                                                                                                         |
++----------------------+-----------------------------+----------------------------------+-----------------+
+|seg_num   0 0        0|UNIX_time_updated            |no_longer_updated incomplete MP4 0|extra_area_length|
++----------------------+-----------------------------+----------------------------------+-----------------+
+|seg_index 0 frag_num 0|sequential_number unavailable|seg_duration_msec                 |sum_of_durations |
++----------------------+-----------------------------+----------------------------------+-----------------+
+...
++----------------------+-----------------------------+----------------------------------+-----------------+
+|frag_duration_msec    |0 0 0             0          |0                 0          0   0|0 0 0 0          |
++----------------------+-----------------------------+----------------------------------+-----------------+
+...
++----------------------+-----------------------------+----------------------------------+-----------------+
+|ftyp/moov                                                                                                :
+...
 
 Specification of "segment pipe":
 
@@ -84,7 +110,30 @@ The sequence of 4-6th bytes (immediately after TS-NULL header) stores the sequen
 12th stores whether this segment is MPEG-TS (0) or MP4 (1).
 32-35th, and subsequent 4 bytes units (until its value is 0) store the size of all fragments contained in the stream.
 
+For Unix FIFO only, there is a 188-bytes field preceding the information packet to store the seg_name.
+
 All other unused bytes are initialized with 0.
+
+ 0    1    2    3    4 5 6             7           8 9 0 1                  2   3 4 5
+(The following 188 bytes are Unix FIFO only)
++-------------------+-----------------------------+------------------------+-----------+
+|0x47 0x1f 0xff 0x10|seg_name field                                                    :
+...(188 bytes)
++-------------------+-----------------------------+------------------------+-----------+
+|0x47 0x1f 0xff 0x10|sequential_number unavailable|number_of_units_or_bytes|MP4 0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|0    0    0    0   |0 0 0             0          |0 0 0 0                 |0   0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|0    0    0    0   |0 0 0             0          |0 0 0 0                 |0   0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|0    0    0    0   |0 0 0             0          |0 0 0 0                 |0   0 0 0  |
++-------------------+-----------------------------+------------------------+-----------+
+|frag_size_0        |frag_size_1                  |frag_size_2             |frag_size_3|
++-------------------+-----------------------------+------------------------+-----------+
+...(188 bytes)
++-------------------+-----------------------------+------------------------+-----------+
+|MPEG-TS/MP4 stream                                                                    :
+...
 
 Notes:
 

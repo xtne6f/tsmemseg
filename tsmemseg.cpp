@@ -357,21 +357,28 @@ void WriteUint32(uint8_t *buf, uint32_t n)
     buf[3] = static_cast<uint8_t>(n >> 24);
 }
 
-void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex,
+void AssignSegmentList(std::vector<uint8_t> &buf, const char *signature, const std::vector<SEGMENT_CONTEXT> &segments, size_t segIndex,
                        bool endList, bool incomplete, bool isMp4, const std::vector<uint8_t> &mp4Header)
 {
-    buf.assign(segments.size() * 16, 0);
-    WriteUint32(&buf[0], static_cast<uint32_t>(segments.size() - 1));
-    WriteUint32(&buf[4], GetCurrentUnixTime());
-    buf[8] = endList;
-    buf[9] = incomplete;
-    buf[10] = isMp4;
+    buf.assign(segments.size() * 16 + (signature ? 64 : 0), 0);
+    size_t ofs = 0;
+    if (signature) {
+        for (size_t i = 0; i < 64 && signature[i]; ++i) {
+            buf[i] = signature[i];
+        }
+        ofs = 64;
+    }
+    WriteUint32(&buf[ofs], static_cast<uint32_t>(segments.size() - 1));
+    WriteUint32(&buf[ofs + 4], GetCurrentUnixTime());
+    buf[ofs + 8] = endList;
+    buf[ofs + 9] = incomplete;
+    buf[ofs + 10] = isMp4;
     for (size_t i = segIndex, j = 1; j < segments.size(); ++j) {
-        WriteUint32(&buf[j * 16], static_cast<uint32_t>(i));
-        WriteUint32(&buf[j * 16 + 2], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
-        WriteUint32(&buf[j * 16 + 4], segments[i].segCount);
-        WriteUint32(&buf[j * 16 + 8], segments[i].segDurationMsec);
-        WriteUint32(&buf[j * 16 + 12], static_cast<uint32_t>(segments[i].segTimeMsec / 10));
+        WriteUint32(&buf[ofs + j * 16], static_cast<uint32_t>(i));
+        WriteUint32(&buf[ofs + j * 16 + 2], static_cast<uint32_t>(segments[i].fragDurationsMsec.size()));
+        WriteUint32(&buf[ofs + j * 16 + 4], segments[i].segCount);
+        WriteUint32(&buf[ofs + j * 16 + 8], segments[i].segDurationMsec);
+        WriteUint32(&buf[ofs + j * 16 + 12], static_cast<uint32_t>(segments[i].segTimeMsec / 10));
         for (size_t k = 0; k < segments[i].fragDurationsMsec.size(); ++k) {
             buf.insert(buf.end(), 16, 0);
             WriteUint32(&buf[buf.size() - 16], segments[i].fragDurationsMsec[k]);
@@ -379,27 +386,39 @@ void AssignSegmentList(std::vector<uint8_t> &buf, const std::vector<SEGMENT_CONT
         i = i % (segments.size() - 1) + 1;
     }
     buf.insert(buf.end(), mp4Header.begin(), mp4Header.end());
-    WriteUint32(&buf[12], static_cast<uint32_t>(buf.size() - segments.size() * 16));
+    WriteUint32(&buf[ofs + 12], static_cast<uint32_t>(buf.size() - segments.size() * 16 - ofs));
 }
 
-void WriteSegmentHeader(std::vector<uint8_t> &buf, uint32_t segCount, bool isMp4, const std::vector<size_t> &fragSizes)
+void WriteSegmentHeader(std::vector<uint8_t> &buf, const char *signature, uint32_t segCount, bool isMp4, const std::vector<size_t> &fragSizes)
 {
+    size_t ofs = 0;
+    if (signature) {
+        // NULL TS header
+        buf[0] = 0x47;
+        buf[1] = 0x1f;
+        buf[2] = 0xff;
+        buf[3] = 0x10;
+        for (size_t i = 0; i < 184 && signature[i]; ++i) {
+            buf[i + 4] = signature[i];
+        }
+        ofs = 188;
+    }
     // NULL TS header
-    buf[0] = 0x47;
-    buf[1] = 0x1f;
-    buf[2] = 0xff;
-    buf[3] = 0x10;
-    WriteUint32(&buf[4], segCount);
-    WriteUint32(&buf[8], static_cast<uint32_t>((buf.size() - 188) / (isMp4 ? 1 : 188)));
-    buf[12] = isMp4;
+    buf[ofs] = 0x47;
+    buf[ofs + 1] = 0x1f;
+    buf[ofs + 2] = 0xff;
+    buf[ofs + 3] = 0x10;
+    WriteUint32(&buf[ofs + 4], segCount);
+    WriteUint32(&buf[ofs + 8], static_cast<uint32_t>((buf.size() - 188 - ofs) / (isMp4 ? 1 : 188)));
+    buf[ofs + 12] = isMp4;
     if (isMp4) {
-        size_t remainSize = buf.size() - 188;
+        size_t remainSize = buf.size() - 188 - ofs;
         size_t i = 0;
         for (; i + 1 < std::min(fragSizes.size(), MP4_FRAG_MAX_NUM) && remainSize >= fragSizes[i]; ++i) {
-            WriteUint32(&buf[i * 4 + 32], static_cast<uint32_t>(fragSizes[i]));
+            WriteUint32(&buf[ofs + i * 4 + 32], static_cast<uint32_t>(fragSizes[i]));
             remainSize -= fragSizes[i];
         }
-        WriteUint32(&buf[i * 4 + 32], static_cast<uint32_t>(remainSize));
+        WriteUint32(&buf[ofs + i * 4 + 32], static_cast<uint32_t>(remainSize));
     }
 }
 
@@ -807,6 +826,9 @@ int main(int argc, char **argv)
 #ifdef _WIN32
     // Used for asynchronous writing of segments.
     std::vector<std::unique_ptr<CManualResetEvent>> events;
+    const char *signature = nullptr;
+#else
+    const char *signature = destName;
 #endif
 
     while (segments.size() < 1 + segNum) {
@@ -836,8 +858,8 @@ int main(int argc, char **argv)
 #endif
         seg.segCount = SEGMENT_COUNT_EMPTY;
         if (!segments.empty()) {
-            seg.buf.assign(188, 0);
-            WriteSegmentHeader(seg.buf, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
+            seg.buf.assign(signature ? 376 : 188, 0);
+            WriteSegmentHeader(seg.buf, signature, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
         }
         segments.push_back(std::move(seg));
     }
@@ -846,7 +868,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: pipe/fifo creation failed.\n");
         return 1;
     }
-    AssignSegmentList(segments.front().buf, segments, 1, false, false, isMp4, mp4frag.GetHeader());
+    AssignSegmentList(segments.front().buf, signature, segments, 1, false, false, isMp4, mp4frag.GetHeader());
 
 #ifndef _WIN32
     struct sigaction sigact = {};
@@ -949,7 +971,7 @@ int main(int argc, char **argv)
         }
 
         std::vector<uint8_t> &segBuf = SelectWritableSegmentBuffer(seg);
-        segBuf.assign(188, 0);
+        segBuf.assign(signature ? 376 : 188, 0);
 
         if (isMp4) {
             seg.fragDurationsMsec = mp4frag.GetFragmentDurationsMsec();
@@ -974,12 +996,12 @@ int main(int argc, char **argv)
             segBuf.insert(segBuf.end(), packets.begin(), packets.end());
         }
 
-        WriteSegmentHeader(segBuf, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
+        WriteSegmentHeader(segBuf, signature, seg.segCount, isMp4, mp4frag.GetFragmentSizes());
         if (!segIncomplete) {
             mp4frag.ClearFragments();
         }
         std::vector<uint8_t> &segfrBuf = SelectWritableSegmentBuffer(segments.front());
-        AssignSegmentList(segfrBuf, segments, segIndex, false, segIncomplete, isMp4, mp4frag.GetHeader());
+        AssignSegmentList(segfrBuf, signature, segments, segIndex, false, segIncomplete, isMp4, mp4frag.GetHeader());
         return false;
     });
 
@@ -988,7 +1010,7 @@ int main(int argc, char **argv)
 
         // End list
         std::vector<uint8_t> &segfrBuf = SelectWritableSegmentBuffer(segments.front());
-        AssignSegmentList(segfrBuf, segments, segIndex, true, false, isMp4, mp4frag.GetHeader());
+        AssignSegmentList(segfrBuf, signature, segments, segIndex, true, false, isMp4, mp4frag.GetHeader());
     }
 
     if (syncError) {
