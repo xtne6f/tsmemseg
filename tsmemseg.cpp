@@ -294,7 +294,7 @@ void Worker(std::vector<SEGMENT_CONTEXT> &segments, CManualResetEvent &stopEvent
                     timeval tv = {};
                     tv.tv_usec = static_cast<long>(std::max<int64_t>(tick - GetMsecTick(), 0) * 1000);
                     if (tv.tv_usec <= 0 || tv.tv_usec >= 1000000 ||
-                        select(maxfd + 1, &wfd, nullptr, nullptr, &tv) < 0 ||
+                        select(maxfd + 1, nullptr, &wfd, nullptr, &tv) < 0 ||
                         stopEvent.WaitOne(std::chrono::milliseconds(0))) {
                         break;
                     }
