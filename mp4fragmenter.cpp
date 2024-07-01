@@ -1,4 +1,5 @@
 #include "mp4fragmenter.hpp"
+#include <stdio.h>
 #include <algorithm>
 
 namespace
@@ -251,13 +252,7 @@ void CMp4Fragmenter::AddPackets(const std::vector<uint8_t> &packets, const PMT &
     if (m_moov.empty()) {
         if ((pmt.first_video_pid == 0 || m_codecWidth >= 0) &&
             (pmt.first_adts_audio_pid == 0 || m_aacProfile >= 0)) {
-            PushBox(m_moov, "ftyp", [](std::vector<uint8_t> &data) {
-                PushString(data, "isom");
-                PushUint(data, 1);
-                PushString(data, "isom");
-                PushString(data, "avc1");
-            });
-            PushMoov(m_moov);
+            PushFtypAndMoov(m_moov);
         }
     }
     if (!m_moov.empty()) {
@@ -341,9 +336,10 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
             size_t sampleSize = 0;
             ParseNals(&pes[payloadPos], pes.size() - payloadPos,
                       [this, h265, &parameterChanged, &isKey, &sampleSize](const uint8_t *nal, size_t len) {
-                if (len > 0) {
+                if (len >= (h265 ? 2 : 1)) {
                     int nalUnitType = h265 ? (nal[0] >> 1) & 0x3f : nal[0] & 0x1f;
                     if (h265 && nalUnitType == 32) {
+                        // "Multiple VPS" is not supported
                         if (m_vps.size() != len || !std::equal(nal, nal + len, m_vps.begin())) {
                             if (m_moov.empty()) {
                                 m_vps.assign(nal, nal + len);
@@ -355,6 +351,7 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         }
                     }
                     else if (nalUnitType == (h265 ? 33 : 7)) {
+                        // "Multiple SPS" is not supported
                         if (m_sps.size() != len || !std::equal(nal, nal + len, m_sps.begin())) {
                             if (m_moov.empty()) {
                                 m_sps.assign(nal, nal + len);
@@ -368,16 +365,28 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         }
                     }
                     else if (nalUnitType == (h265 ? 34 : 8)) {
-                        if (m_pps.size() != len || !std::equal(nal, nal + len, m_pps.begin())) {
-                            if (m_moov.empty()) {
-                                m_pps.assign(nal, nal + len);
-                                if (h265) {
-                                    ParseH265Pps(m_pps);
+                        uint8_t sliceIntro[8] = {};
+                        std::copy(nal + (h265 ? 2 : 1), nal + std::min(len, (h265 ? 2 : 1) + sizeof(sliceIntro)), sliceIntro);
+                        size_t pos = 0;
+                        int picParameterSetID = ReadUegBits(sliceIntro, pos);
+                        if (m_ppsMap.count(picParameterSetID) == 0) {
+                            if (m_ppsMap.size() < 255) {
+                                m_ppsMap.emplace(picParameterSetID, std::vector<uint8_t>(nal, nal + len));
+                                if (m_moov.empty()) {
+                                    if (h265 && m_ppsMap.size() == 1) {
+                                        ParseH265Pps(m_ppsMap[picParameterSetID]);
+                                    }
+                                }
+                                else {
+                                    fprintf(stderr, "Warning: New PPS found. Updating moov atom.\n");
+                                    m_moov.clear();
+                                    PushFtypAndMoov(m_moov);
                                 }
                             }
-                            else {
-                                parameterChanged = true;
-                            }
+                        }
+                        else if (m_ppsMap[picParameterSetID].size() != len ||
+                                 !std::equal(nal, nal + len, m_ppsMap[picParameterSetID].begin())) {
+                            parameterChanged = true;
                         }
                     }
                     else if (nalUnitType == (h265 ? 35 : 9)) {
@@ -422,6 +431,9 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
             }
 
             if (m_codecWidth < 0 || parameterChanged) {
+                if (parameterChanged) {
+                    fprintf(stderr, "Warning: Video parameters have changed.\n");
+                }
                 m_videoMdat.clear();
                 m_videoSampleInfos.clear();
             }
@@ -539,8 +551,15 @@ void CMp4Fragmenter::AddID3Pes(const std::vector<uint8_t> &pes)
     }
 }
 
-void CMp4Fragmenter::PushMoov(std::vector<uint8_t> &data) const
+void CMp4Fragmenter::PushFtypAndMoov(std::vector<uint8_t> &data) const
 {
+    PushBox(data, "ftyp", [](std::vector<uint8_t> &data) {
+        PushString(data, "isom");
+        PushUint(data, 1);
+        PushString(data, "isom");
+        PushString(data, "avc1");
+    });
+
     PushBox(data, "moov", [this](std::vector<uint8_t> &data) {
         PushFullBox(data, "mvhd", 0x00000000, [](std::vector<uint8_t> &data) {
             PushUint(data, 0);
@@ -677,20 +696,38 @@ void CMp4Fragmenter::PushMoov(std::vector<uint8_t> &data) const
                                             data.push_back(((m_numTemporalLayers & 0x07) << 3) | (m_temporalIDNestingFlag << 2) | 3);
                                             data.push_back(3);
                                             data.push_back(0x80 | 32);
-                                            data.push_back(0);
-                                            data.push_back(1);
-                                            PushUshort(data, static_cast<uint32_t>(m_vps.size()));
-                                            data.insert(data.end(), m_vps.begin(), m_vps.end());
+                                            PushUshort(data, m_vps.empty() ? 0 : 1);
+                                            if (m_vps.empty()) {
+                                                fprintf(stderr, "Warning: No VPS was found when generating moov atom.\n");
+                                            }
+                                            else {
+                                                PushUshort(data, static_cast<uint32_t>(m_vps.size()));
+                                                data.insert(data.end(), m_vps.begin(), m_vps.end());
+                                            }
                                             data.push_back(0x80 | 33);
-                                            data.push_back(0);
-                                            data.push_back(1);
+                                            PushUshort(data, 1);
                                             PushUshort(data, static_cast<uint32_t>(m_sps.size()));
                                             data.insert(data.end(), m_sps.begin(), m_sps.end());
                                             data.push_back(0x80 | 34);
-                                            data.push_back(0);
-                                            data.push_back(1);
-                                            PushUshort(data, static_cast<uint32_t>(m_pps.size()));
-                                            data.insert(data.end(), m_pps.begin(), m_pps.end());
+                                            PushUshort(data, static_cast<uint32_t>(m_ppsMap.size()));
+                                            if (m_ppsMap.empty()) {
+                                                fprintf(stderr, "Warning: No PPS was found when generating moov atom.\n");
+                                            }
+                                            for (int idMin = -1;;) {
+                                                // ascending order
+                                                auto itMin = m_ppsMap.end();
+                                                for (auto it = m_ppsMap.begin(); it != m_ppsMap.end(); ++it) {
+                                                    if (it->first > idMin && (itMin == m_ppsMap.end() || itMin->first > it->first)) {
+                                                        itMin = it;
+                                                    }
+                                                }
+                                                if (itMin == m_ppsMap.end()) {
+                                                    break;
+                                                }
+                                                idMin = itMin->first;
+                                                PushUshort(data, static_cast<uint32_t>(itMin->second.size()));
+                                                data.insert(data.end(), itMin->second.begin(), itMin->second.end());
+                                            }
                                         });
                                     }
                                     else {
@@ -703,9 +740,25 @@ void CMp4Fragmenter::PushMoov(std::vector<uint8_t> &data) const
                                             data.push_back(0xe1);
                                             PushUshort(data, static_cast<uint32_t>(m_sps.size()));
                                             data.insert(data.end(), m_sps.begin(), m_sps.end());
-                                            data.push_back(1);
-                                            PushUshort(data, static_cast<uint32_t>(m_pps.size()));
-                                            data.insert(data.end(), m_pps.begin(), m_pps.end());
+                                            data.push_back(static_cast<uint8_t>(m_ppsMap.size()));
+                                            if (m_ppsMap.empty()) {
+                                                fprintf(stderr, "Warning: No PPS was found when generating moov atom.\n");
+                                            }
+                                            for (int idMin = -1;;) {
+                                                // ascending order
+                                                auto itMin = m_ppsMap.end();
+                                                for (auto it = m_ppsMap.begin(); it != m_ppsMap.end(); ++it) {
+                                                    if (it->first > idMin && (itMin == m_ppsMap.end() || itMin->first > it->first)) {
+                                                        itMin = it;
+                                                    }
+                                                }
+                                                if (itMin == m_ppsMap.end()) {
+                                                    break;
+                                                }
+                                                idMin = itMin->first;
+                                                PushUshort(data, static_cast<uint32_t>(itMin->second.size()));
+                                                data.insert(data.end(), itMin->second.begin(), itMin->second.end());
+                                            }
                                             if (m_sps[3] != 66 && m_sps[3] != 77 && m_sps[3] != 88) {
                                                 data.push_back(static_cast<uint8_t>(0xfc | m_chromaFormatIdc));
                                                 data.push_back(static_cast<uint8_t>(0xf8 | m_bitDepthLumaMinus8));
