@@ -3,6 +3,7 @@
 
 #include "util.hpp"
 #include <stdint.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -21,7 +22,7 @@ private:
     void AddVideoPes(const std::vector<uint8_t> &pes, bool h265);
     void AddAudioPes(const std::vector<uint8_t> &pes);
     void AddID3Pes(const std::vector<uint8_t> &pes);
-    void PushMoov(std::vector<uint8_t> &data) const;
+    void PushFtypAndMoov(std::vector<uint8_t> &data) const;
     void PushMoof(std::vector<uint8_t> &data, std::pair<int, int> &fragDuration, uint32_t &fragCount) const;
     bool ParseSps(const std::vector<uint8_t> &ebspSps);
     bool ParseH265Sps(const std::vector<uint8_t> &ebspSps);
@@ -75,7 +76,7 @@ private:
     bool m_temporalIDNestingFlag;
     std::vector<uint8_t> m_vps;
     std::vector<uint8_t> m_sps;
-    std::vector<uint8_t> m_pps;
+    std::unordered_map<int, std::vector<uint8_t>> m_ppsMap;
 
     struct VIDEO_SAMPLE_INFO
     {
