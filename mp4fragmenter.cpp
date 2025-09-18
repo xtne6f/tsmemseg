@@ -149,6 +149,7 @@ CMp4Fragmenter::CMp4Fragmenter()
     , m_audioPts(-1)
     , m_audioDecodeTime(0)
     , m_audioDecodeTimePts(-1)
+    , m_parameterChanged(false)
     , m_codecWidth(-1)
     , m_parallelismType(0)
     , m_numTemporalLayers(1)
@@ -341,26 +342,26 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                     if (h265 && nalUnitType == 32) {
                         // "Multiple VPS" is not supported
                         if (m_vps.size() != len || !std::equal(nal, nal + len, m_vps.begin())) {
+                            m_vps.assign(nal, nal + len);
                             if (m_moov.empty()) {
-                                m_vps.assign(nal, nal + len);
                                 ParseVps(m_vps);
                             }
                             else {
-                                parameterChanged = true;
+                                m_parameterChanged = parameterChanged = true;
                             }
                         }
                     }
                     else if (nalUnitType == (h265 ? 33 : 7)) {
                         // "Multiple SPS" is not supported
                         if (m_sps.size() != len || !std::equal(nal, nal + len, m_sps.begin())) {
+                            m_sps.assign(nal, nal + len);
                             if (m_moov.empty()) {
-                                m_sps.assign(nal, nal + len);
                                 if (!(h265 ? ParseH265Sps(m_sps) : ParseSps(m_sps))) {
                                     m_codecWidth = -1;
                                 }
                             }
                             else {
-                                parameterChanged = true;
+                                m_parameterChanged = parameterChanged = true;
                             }
                         }
                     }
@@ -386,7 +387,10 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         }
                         else if (m_ppsMap[picParameterSetID].size() != len ||
                                  !std::equal(nal, nal + len, m_ppsMap[picParameterSetID].begin())) {
-                            parameterChanged = true;
+                            m_ppsMap[picParameterSetID].assign(nal, nal + len);
+                            if (!m_moov.empty()) {
+                                m_parameterChanged = parameterChanged = true;
+                            }
                         }
                     }
                     else if (nalUnitType == (h265 ? 35 : 9)) {
@@ -399,6 +403,33 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
                         if (h265 ? (nalUnitType >= 16 && nalUnitType <= 21) : (nalUnitType == 5)) {
                             // IRAP (BLA or CRA or IDR)
                             isKey = true;
+                            if (m_parameterChanged) {
+                                // inline VPS/SPS/PPS
+                                if (!m_vps.empty()) {
+                                    sampleSize += 4 + m_vps.size();
+                                    PushUint(m_videoMdat, static_cast<uint32_t>(m_vps.size()));
+                                    m_videoMdat.insert(m_videoMdat.end(), m_vps.begin(), m_vps.end());
+                                }
+                                sampleSize += 4 + m_sps.size();
+                                PushUint(m_videoMdat, static_cast<uint32_t>(m_sps.size()));
+                                m_videoMdat.insert(m_videoMdat.end(), m_sps.begin(), m_sps.end());
+                                for (int idMin = -1;;) {
+                                    // ascending order
+                                    auto itMin = m_ppsMap.end();
+                                    for (auto it = m_ppsMap.begin(); it != m_ppsMap.end(); ++it) {
+                                        if (it->first > idMin && (itMin == m_ppsMap.end() || itMin->first > it->first)) {
+                                            itMin = it;
+                                        }
+                                    }
+                                    if (itMin == m_ppsMap.end()) {
+                                        break;
+                                    }
+                                    idMin = itMin->first;
+                                    sampleSize += 4 + itMin->second.size();
+                                    PushUint(m_videoMdat, static_cast<uint32_t>(itMin->second.size()));
+                                    m_videoMdat.insert(m_videoMdat.end(), itMin->second.begin(), itMin->second.end());
+                                }
+                            }
                         }
                         else if (!h265 && nalUnitType == 1) {
                             // Non-IDR
@@ -426,18 +457,15 @@ void CMp4Fragmenter::AddVideoPes(const std::vector<uint8_t> &pes, bool h265)
             if (m_moov.empty()) {
                 m_h265 = h265;
             }
-            else if (m_h265 != h265) {
-                parameterChanged = true;
-            }
 
-            if (m_codecWidth < 0 || parameterChanged) {
-                if (parameterChanged) {
-                    fprintf(stderr, "Warning: Video parameters have changed.\n");
-                }
+            if (m_codecWidth < 0 || m_h265 != h265) {
                 m_videoMdat.clear();
                 m_videoSampleInfos.clear();
             }
             else {
+                if (parameterChanged) {
+                    fprintf(stderr, "Warning: Video parameters have changed.\n");
+                }
                 VIDEO_SAMPLE_INFO info;
                 info.sampleSize = static_cast<uint32_t>(sampleSize);
                 info.isKey = isKey;

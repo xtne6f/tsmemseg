@@ -824,8 +824,7 @@ int main(int argc, char **argv)
                     return true;
                 }
             }
-            fflush(wfp);
-            return false;
+            return fflush(wfp) != 0;
         });
 
         if (syncError) {
