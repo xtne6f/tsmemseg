@@ -54,6 +54,10 @@ private:
     std::vector<uint8_t> m_videoMdat;
     std::vector<uint8_t> m_audioMdat;
     std::vector<uint8_t> m_moov;
+    std::vector<uint8_t> m_vps;
+    std::vector<uint8_t> m_sps;
+    std::unordered_map<int, std::vector<uint8_t>> m_ppsMap;
+    bool m_parameterChanged;
 
     // These members are valid if (m_codecWidth >= 0)
     int m_codecWidth;
@@ -74,9 +78,6 @@ private:
     int m_parallelismType;
     int m_numTemporalLayers;
     bool m_temporalIDNestingFlag;
-    std::vector<uint8_t> m_vps;
-    std::vector<uint8_t> m_sps;
-    std::unordered_map<int, std::vector<uint8_t>> m_ppsMap;
 
     struct VIDEO_SAMPLE_INFO
     {
