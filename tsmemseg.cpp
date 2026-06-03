@@ -97,6 +97,9 @@ struct SEGMENT_PIPE_CONTEXT
 struct SEGMENT_CONTEXT
 {
     char path[256];
+#ifndef _WIN32
+    char closingPath[256];
+#endif
     SEGMENT_PIPE_CONTEXT pipes[2];
     std::vector<uint8_t> buf;
     std::vector<uint8_t> backBuf;
@@ -133,7 +136,8 @@ void ClosingRunner(const char *closingCmd, CManualResetEvent &stopEvent, std::at
             break;
         }
     }
-    system(closingCmd);
+    int status = system(closingCmd);
+    static_cast<void>(status);
 }
 
 #ifdef _WIN32
@@ -330,7 +334,17 @@ void CloseSegments(const std::vector<SEGMENT_CONTEXT> &segments)
             }
         }
 #else
-        unlink(it->path);
+        // Must be async-signal-safe
+        const char *path = it->path;
+        if (rename(it->path, it->closingPath) == 0) {
+            path = it->closingPath;
+        }
+        // To ensure that the reading side is closed.
+        int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) {
+            close(fd);
+        }
+        unlink(path);
 #endif
     }
 }
@@ -865,9 +879,12 @@ int main(int argc, char **argv)
             // path too long
             break;
         }
-        sprintf(seg.path, "%s%stsmemseg_%s%02d.fifo", dirLen ? fifoDir : "/tmp/",
-                                                      dirLen && fifoDir[dirLen - 1] != '/' ? "/" : "",
-                                                      destName, static_cast<int>(segments.size()));
+        // ".fifo" and ".fif_"
+        int pathLen = sprintf(seg.path, "%s%stsmemseg_%s%02d.fifo", dirLen ? fifoDir : "/tmp/",
+                                                                    dirLen && fifoDir[dirLen - 1] != '/' ? "/" : "",
+                                                                    destName, static_cast<int>(segments.size()));
+        strcpy(seg.closingPath, seg.path);
+        seg.closingPath[pathLen - 1] = '_';
         if (mkfifo(seg.path, S_IRUSR + S_IWUSR + (dirLen ? S_IRGRP + S_IWGRP + S_IROTH + S_IWOTH : 0)) != 0) {
             break;
         }
